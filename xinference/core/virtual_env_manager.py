@@ -137,9 +137,15 @@ PYTORCH_PACKAGES = {"torch", "torchaudio", "torchvision", "torchcodec"}
 # environment (no GPU, or an unsupported CUDA line) falls back to the default
 # PyPI index, which serves the CPU build.
 # See https://github.com/xorbitsai/xllamacpp for the official install commands.
+# Overridable because the public index is a GitHub Pages host: where that is
+# unreachable, offline mode's only alternative is the CPU build, and a
+# preinstalled GPU wheel does not help either (the install is forced).
+XLLAMACPP_INDEX_BASE = os.environ.get(
+    "XINFERENCE_XLLAMACPP_INDEX_BASE", "https://xorbitsai.github.io/xllamacpp/whl"
+).rstrip("/")
 XLLAMACPP_CUDA_INDEX_URLS: Dict[str, str] = {
-    "cu132": "https://xorbitsai.github.io/xllamacpp/whl/cu132",
-    "cu128": "https://xorbitsai.github.io/xllamacpp/whl/cu128",
+    "cu132": f"{XLLAMACPP_INDEX_BASE}/cu132",
+    "cu128": f"{XLLAMACPP_INDEX_BASE}/cu128",
 }
 
 
