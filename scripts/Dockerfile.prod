@@ -1,0 +1,27 @@
+# Incremental prod image: the base already carries CUDA, torch and every
+# runtime dep, so only the xinference package is replaced.
+# Build context is the deploy directory, so the xllamacpp wheel served by the
+# local index is reused here instead of being shipped twice.
+FROM xprobe/xinference:latest
+
+COPY dist/xinference-*.whl wheels/cu132/xllamacpp/xllamacpp-*.whl /tmp/
+
+# xorbitsai.github.io (the only xllamacpp GPU wheel index) is unreachable from
+# this host. Preinstalling is not enough on its own — the launch path forces a
+# reinstall — but it keeps a working GPU build present if the local index is
+# ever down. It must land in system site-packages: the skip-installed filter
+# only inspects the parent env. gguf is xllamacpp.memory's optional dep, used
+# to estimate GPU layers.
+RUN python3 -m pip install --no-deps /tmp/xllamacpp-*.whl \
+ && python3 -m pip install gguf
+
+# Two copies of the package exist and WORKDIR=/opt/inference puts that one
+# first on sys.path, so updating only dist-packages would change nothing.
+# --no-deps: the only newly declared dependency upstream added is `anthropic`,
+# which xinference imports under try/except ImportError; pulling it would drag
+# httpx/pydantic upgrades across a working CUDA env for an optional API shim.
+RUN python3 -m pip install --no-deps --force-reinstall /tmp/xinference-*.whl \
+ && rm -rf /opt/inference/xinference \
+ && cp -r /usr/local/lib/python3.12/dist-packages/xinference /opt/inference/xinference \
+ && rm -f /tmp/*.whl \
+ && python3 -m pip cache purge
