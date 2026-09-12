@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import multiprocessing
@@ -1136,7 +1137,9 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
             messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
         )
 
-        images, video_inputs = process_vision_info(messages)
+        # Blocking downloads: keep them off the actor's event loop, otherwise a
+        # slow media URL stalls every other request served by this model.
+        images, video_inputs = await asyncio.to_thread(process_vision_info, messages)
         if video_inputs:
             raise ValueError("Not support video input now.")
 

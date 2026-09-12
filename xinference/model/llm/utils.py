@@ -40,6 +40,7 @@ from typing import (
 import requests
 from PIL import Image
 
+from ...constants import XINFERENCE_MEDIA_FETCH_TIMEOUT
 from ...types import (
     ChatCompletion,
     ChatCompletionChoice,
@@ -57,6 +58,7 @@ from ...types import (
     CompletionUsage,
     ToolCallDelta,
 )
+from ..media_source import validate_media_source, validate_messages_media
 from .core import chat_context_var
 from .reasoning_parser import ReasoningParser
 from .tool_parsers.glm4_tool_parser import Glm4ToolParser
@@ -1166,6 +1168,9 @@ class ChatModelMixin:
         self,
         messages: Union[List[ChatCompletionMessage], List[dict]],
     ):
+        # Every engine's multimodal path funnels through here, so this is the
+        # one place that sees client-supplied media before something fetches it.
+        validate_messages_media(messages)
         transformed_messages = []
         for msg in messages:
             new_content = []
@@ -1423,25 +1428,12 @@ def get_model_version(
 
 
 def _decode_image(_url):
-    if _url.startswith("data:"):
-        logging.info("Parse url by base64 decoder.")
-        # https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images
-        # e.g. f"data:image/jpeg;base64,{base64_image}"
-        _type, data = _url.split(";")
-        _, ext = _type.split("/")
-        data = data[len("base64,") :]
-        data = base64.b64decode(data.encode("utf-8"))
-        return Image.open(BytesIO(data)).convert("RGB")
-    else:
-        try:
-            response = requests.get(_url)
-        except requests.exceptions.MissingSchema:
-            return Image.open(_url).convert("RGB")
-        else:
-            return Image.open(BytesIO(response.content)).convert("RGB")
+    image = _decode_image_without_rgb(_url)
+    return image.convert("RGB")
 
 
 def _decode_image_without_rgb(_url):
+    validate_media_source(_url)
     if _url.startswith("data:"):
         logging.info("Parse url by base64 decoder.")
         # https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images
@@ -1453,10 +1445,15 @@ def _decode_image_without_rgb(_url):
         return Image.open(BytesIO(data))
     else:
         try:
-            response = requests.get(_url)
+            # Without a timeout a dead host pins the model actor until the OS
+            # gives up, which stalls every other request on that model.
+            response = requests.get(_url, timeout=XINFERENCE_MEDIA_FETCH_TIMEOUT)
         except requests.exceptions.MissingSchema:
+            # validate_media_source already rejected local paths unless they are
+            # explicitly allowed.
             return Image.open(_url)
         else:
+            response.raise_for_status()
             return Image.open(BytesIO(response.content))
 
 

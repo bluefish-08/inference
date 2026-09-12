@@ -2680,15 +2680,24 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     model_family
                 )
 
+                # These helpers download every referenced image/audio/video
+                # with blocking IO. Run off the event loop: this coroutine is
+                # awaited directly by the model actor, so a slow fetch here
+                # stalls every other request that actor is serving.
                 if "omni" in self.model_family.model_ability:
-                    audios, images, videos, video_kwargs = process_mm_info(
-                        messages, use_audio_in_video=True, return_video_kwargs=True
+                    audios, images, videos, video_kwargs = await asyncio.to_thread(
+                        process_mm_info,
+                        messages,
+                        use_audio_in_video=True,
+                        return_video_kwargs=True,
                     )
                 elif "audio" in self.model_family.model_ability:
-                    audios = process_audio_info(messages, use_audio_in_video=False)
+                    audios = await asyncio.to_thread(
+                        process_audio_info, messages, use_audio_in_video=False
+                    )
                 elif "vision" in self.model_family.model_ability:
-                    images, videos, video_kwargs = process_vision_info(  # type: ignore
-                        messages, return_video_kwargs=True
+                    images, videos, video_kwargs = await asyncio.to_thread(  # type: ignore
+                        process_vision_info, messages, return_video_kwargs=True
                     )
 
                 prompt = self.get_full_context(
