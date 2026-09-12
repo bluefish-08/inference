@@ -1111,7 +1111,9 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
         from PIL import Image
         from qwen_vl_utils import process_vision_info
 
-        messages = self._transform_messages(messages)
+        # Validates client-supplied media references; the private-address
+        # check resolves hostnames, and getaddrinfo blocks the event loop.
+        messages = await asyncio.to_thread(self._transform_messages, messages)
 
         tools = list(generate_config.pop("tools", [])) if generate_config else None
         # Handle empty chat_template by falling back to tokenizer's chat_template

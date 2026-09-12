@@ -94,7 +94,11 @@ def validate_media_source(
     if reference.startswith(REMOTE_SCHEMES):
         if not block_private_address:
             return
-        host = urlparse(reference).hostname
+        try:
+            host = urlparse(reference).hostname
+        except ValueError as e:
+            # Malformed URLs (bad IPv6 brackets, ...) raise instead of parsing.
+            raise MediaSourceError(f"Invalid media URL: {e}") from e
         # Resolution here is advisory: the fetcher resolves again, so a rebinding
         # DNS entry can still slip through. Network policy remains the real control.
         if host and _is_blocked_address(host):

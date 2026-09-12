@@ -628,15 +628,15 @@ XINFERENCE_HTTP_LIMIT_CONCURRENCY = (
 # Media references (image/video/audio URLs) supplied in chat requests are
 # fetched server-side. Unrestricted, that is an SSRF and local-file-read
 # primitive, so local paths are rejected unless explicitly allowed.
-XINFERENCE_MEDIA_ALLOW_LOCAL_PATH = os.environ.get(
-    "XINFERENCE_MEDIA_ALLOW_LOCAL_PATH", "false"
-).lower() in ("1", "true", "yes")
+XINFERENCE_MEDIA_ALLOW_LOCAL_PATH = parse_env_bool(
+    "XINFERENCE_MEDIA_ALLOW_LOCAL_PATH", False
+)
 # Opt-in: also refuse URLs resolving to loopback/private/link-local addresses.
 # Off by default because serving media from an intranet host is a legitimate
 # and common deployment.
-XINFERENCE_MEDIA_BLOCK_PRIVATE_ADDRESS = os.environ.get(
-    "XINFERENCE_MEDIA_BLOCK_PRIVATE_ADDRESS", "false"
-).lower() in ("1", "true", "yes")
+XINFERENCE_MEDIA_BLOCK_PRIVATE_ADDRESS = parse_env_bool(
+    "XINFERENCE_MEDIA_BLOCK_PRIVATE_ADDRESS", False
+)
 # Seconds allowed for a server-side media fetch. Without it requests hang on
 # the model actor lock until the OS gives up.
 XINFERENCE_MEDIA_FETCH_TIMEOUT = float(

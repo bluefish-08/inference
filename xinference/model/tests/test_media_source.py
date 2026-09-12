@@ -117,9 +117,17 @@ def _engine_source(relative_path: str) -> str:
     [
         (
             "llm/vllm/core.py",
-            ("process_mm_info", "process_audio_info", "process_vision_info"),
+            (
+                "process_mm_info",
+                "process_audio_info",
+                "process_vision_info",
+                "self._transform_messages",
+            ),
         ),
-        ("llm/sglang/core.py", ("process_vision_info",)),
+        (
+            "llm/sglang/core.py",
+            ("process_vision_info", "self._transform_messages"),
+        ),
     ],
 )
 def test_media_helpers_are_not_called_on_the_event_loop(module, helpers):

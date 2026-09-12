@@ -2654,7 +2654,10 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     temp_dir = tempfile.TemporaryDirectory(prefix="xinference-vllm-")
                     self._handle_base64_media(messages, temp_dir.name)
 
-                messages = self._transform_messages(messages)
+                # Validates client-supplied media references, which resolves
+                # hostnames when private-address blocking is on. getaddrinfo
+                # blocks, so keep it off the actor's event loop too.
+                messages = await asyncio.to_thread(self._transform_messages, messages)
 
                 chat_template_kwargs = (
                     self._get_chat_template_kwargs_from_generate_config(
