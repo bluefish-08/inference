@@ -379,7 +379,10 @@ def create_llm_model_instance(
     logger.debug(f"Launching {model_uid} with {llm_cls.__name__}")
 
     multimodal_projector = kwargs.get("multimodal_projector")
-    if not model_path:
+    if llm_family.model_specs[0].model_format == "external":
+        # served by a remote endpoint; there is nothing to download or cache
+        model_path = model_path or ""
+    elif not model_path:
         cache_manager = LLMCacheManager(llm_family, multimodal_projector)
         model_path = cache_manager.cache()
 

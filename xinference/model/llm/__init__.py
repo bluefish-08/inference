@@ -32,6 +32,7 @@ from .llm_family import (
     BUILTIN_LLM_MODEL_GENERATE_FAMILIES,
     BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES,
     BUILTIN_LLM_PROMPT_STYLE,
+    EXTERNAL_CLASSES,
     LLAMA_CLASSES,
     LLM_ENGINES,
     LMDEPLOY_CLASSES,
@@ -70,6 +71,9 @@ def check_format_with_engine(model_format, engine):
     if model_format in ["ggufv2"] and engine not in ["llama.cpp", "vLLM"]:
         return False
     if model_format not in ["ggufv2"] and engine == "llama.cpp":
+        return False
+    # the proxy engine owns the "external" format exclusively, both ways
+    if (model_format == "external") != (engine == "External"):
         return False
     return True
 
@@ -264,6 +268,7 @@ def load_model_family_from_json(json_filename, target_families):
 
 
 def _install():
+    from .external.core import ExternalChatModel
     from .llama_cpp.core import XllamaCppModel
     from .lmdeploy.core import LMDeployChatModel, LMDeployModel
     from .mlx.core import MLXChatModel, MLXModel, MLXVisionModel
@@ -280,6 +285,7 @@ def _install():
     extend_classes_once(MLX_CLASSES, [MLXModel, MLXChatModel, MLXVisionModel])
     extend_classes_once(LMDEPLOY_CLASSES, [LMDeployModel, LMDeployChatModel])
     extend_classes_once(TRANSFORMERS_CLASSES, [PytorchChatModel, PytorchModel])
+    extend_classes_once(EXTERNAL_CLASSES, [ExternalChatModel])
 
     # support 4 engines for now
     SUPPORTED_ENGINES["vLLM"] = VLLM_CLASSES
@@ -288,6 +294,7 @@ def _install():
     SUPPORTED_ENGINES["llama.cpp"] = LLAMA_CLASSES
     SUPPORTED_ENGINES["MLX"] = MLX_CLASSES
     SUPPORTED_ENGINES["LMDEPLOY"] = LMDEPLOY_CLASSES
+    SUPPORTED_ENGINES["External"] = EXTERNAL_CLASSES
 
     # Distribution-specific engines are appended after the built-ins.
     _run_engine_registration_hooks(MODEL_TYPE_LLM, SUPPORTED_ENGINES)

@@ -315,8 +315,14 @@ class CustomLLMFamilyV2(LLMFamilyV2):
                 f"You must specify `model_family` when registering custom LLM models."
             )
         assert isinstance(llm_spec.model_family, str)
+        # An external model is prompted by the remote server, so the local
+        # tool-call/vision family whitelists (which only pick prompt builders)
+        # do not apply to it.
+        is_external = any(
+            spec.model_format == "external" for spec in llm_spec.model_specs
+        )
         # TODO: Currently, tool call and vision models cannot be registered if it is not the builtin model_family
-        if (
+        if not is_external and (
             "tools" in llm_spec.model_ability
             and llm_spec.model_family not in BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES
         ):
@@ -324,7 +330,7 @@ class CustomLLMFamilyV2(LLMFamilyV2):
                 f"`model_family` for tool call model must be one of the following values: \n"
                 f"{', '.join(list(BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES))}"
             )
-        if (
+        if not is_external and (
             "vision" in llm_spec.model_ability
             and llm_spec.model_family not in vision_model_names
         ):
@@ -367,8 +373,21 @@ class CustomLLMFamilyV2(LLMFamilyV2):
         return llm_spec
 
 
+class ExternalLLMSpecV1(BaseModel):
+    """Placeholder spec for a model served by a remote OpenAI-compatible endpoint."""
+
+    model_format: Literal["external"]
+    model_size_in_billions: Union[str, int] = 0
+    quantization: str = "none"
+    model_id: Optional[str]
+    model_hub: str = "huggingface"
+    model_uri: Optional[str]
+    model_revision: Optional[str]
+    activated_size_in_billions: Optional[Union[str, int]]
+
+
 LLMSpecV1 = Annotated[
-    Union[LlamaCppLLMSpecV2, PytorchLLMSpecV2, MLXLLMSpecV2],
+    Union[LlamaCppLLMSpecV2, PytorchLLMSpecV2, MLXLLMSpecV2, ExternalLLMSpecV1],
     Field(discriminator="model_format"),
 ]
 
@@ -385,6 +404,7 @@ TRANSFORMERS_CLASSES: List[Type[LLM]] = []
 VLLM_CLASSES: List[Type[LLM]] = []
 MLX_CLASSES: List[Type[LLM]] = []
 LMDEPLOY_CLASSES: List[Type[LLM]] = []
+EXTERNAL_CLASSES: List[Type[LLM]] = []
 
 LLM_ENGINES: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 SUPPORTED_ENGINES: Dict[str, List[Type[LLM]]] = {}
