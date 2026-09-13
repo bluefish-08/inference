@@ -25,7 +25,7 @@ import uuid
 import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Union, get_type_hints
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union, get_type_hints
 
 import httpx
 import xoscar as xo
@@ -330,6 +330,20 @@ def _log_setup_required_notice() -> None:
         + "  (or via the web UI's setup page).\n"
         + "=" * 60
     )
+
+
+def _supports_tool_calls(
+    desc: Dict[str, Any], model_family: str, total_call_family: Set[str]
+) -> bool:
+    """Whether tools/tool messages may be forwarded for this model.
+
+    The whitelist gates xinference's *local* tool-call parsers. An external
+    model is prompted and parsed by the remote server, which already returns
+    OpenAI-shaped ``tool_calls``, so the whitelist does not apply to it.
+    """
+    if desc.get("model_format") == "external":
+        return True
+    return model_family in total_call_family
 
 
 class RESTfulAPI(CancelMixin):
@@ -3475,7 +3489,7 @@ class RESTfulAPI(CancelMixin):
             | GLM5_TOOL_CALL_FAMILY
             | KIMI_K3_TOOL_CALL_FAMILY
         )
-        if model_family not in total_call_family:
+        if not _supports_tool_calls(desc, model_family, total_call_family):
             if body.tools:
                 raise HTTPException(
                     status_code=400,
