@@ -3,6 +3,7 @@
 #
 #   scripts/deploy-prod.sh              # full build (rebuilds the Web UI)
 #   scripts/deploy-prod.sh --fast       # reuse the existing Web UI export
+#   scripts/deploy-prod.sh --build-only # build + upload + image, no restart
 #   TAG=mytag scripts/deploy-prod.sh    # override the image tag
 #
 # Run this on a machine with npm. build_web() only *warns* when npm is missing,
@@ -17,10 +18,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 FAST=0
-[ "${1:-}" = "--fast" ] && FAST=1
+BUILD_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --fast) FAST=1 ;;
+    --build-only) BUILD_ONLY=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
 
 echo "==> building wheel ($([ $FAST = 1 ] && echo 'reusing Web UI' || echo 'with Web UI'))"
-rm -rf dist
+# build/ too: setuptools copies into build/lib incrementally and never drops
+# files that vanished from the source, so stale trees keep shipping.
+rm -rf dist build xinference.egg-info
 if [ $FAST = 1 ]; then
   [ -f xinference/ui/web/dist/index.html ] || {
     echo "no existing Web UI export; run without --fast" >&2; exit 1; }
@@ -46,11 +56,17 @@ ssh "$HOST" "mv $DEPLOY_DIR/$(basename "$WHEEL") $DEPLOY_DIR/dist/"
 echo "==> building $IMAGE"
 ssh "$HOST" "cd $DEPLOY_DIR && docker build -q -f Dockerfile.prod -t $IMAGE . >/dev/null"
 
+if [ $BUILD_ONLY = 1 ]; then
+  echo "==> $IMAGE built on $HOST, nothing restarted"
+  echo "    roll out with: ssh $HOST \"cd $DEPLOY_DIR && cp .env .env.bak.\\\$(date +%Y%m%d%H%M%S) && sed -i 's|^XINFERENCE_IMAGE=.*|XINFERENCE_IMAGE=$IMAGE|' .env && docker compose up -d --force-recreate xinference xinference-worker xinference-wheels\""
+  exit 0
+fi
+
 echo "==> switching and restarting"
 ssh "$HOST" "cd $DEPLOY_DIR && \
   cp .env .env.bak.\$(date +%Y%m%d%H%M%S) && \
   sed -i 's|^XINFERENCE_IMAGE=.*|XINFERENCE_IMAGE=$IMAGE|' .env && \
-  docker compose up -d --force-recreate xinference xinference-wheels >/dev/null 2>&1"
+  docker compose up -d --force-recreate xinference xinference-worker xinference-wheels >/dev/null 2>&1"
 
 echo "==> waiting for health"
 for _ in $(seq 30); do
@@ -60,5 +76,10 @@ for _ in $(seq 30); do
 done
 [ "$status" = healthy ] || { echo "container is $status; check: ssh $HOST docker logs --tail 50 xinference-xinference-1" >&2; exit 1; }
 
+# the worker has no healthcheck, but models run there: a crash on the new image
+# would otherwise be invisible because the supervisor stays healthy
+wstate=$(ssh "$HOST" "docker inspect -f '{{.State.Status}}' xinference-xinference-worker-1" 2>/dev/null || echo missing)
+[ "$wstate" = running ] || { echo "worker is $wstate; check: ssh $HOST docker logs --tail 50 xinference-xinference-worker-1" >&2; exit 1; }
+
 ssh "$HOST" "docker exec xinference-xinference-1 python3 -c 'import xinference; print(\"deployed:\", xinference.__version__)'" 2>/dev/null | tail -1
-echo "==> $IMAGE is live (rollback: set XINFERENCE_IMAGE in $DEPLOY_DIR/.env to a previous tag, then docker compose up -d --force-recreate xinference)"
+echo "==> $IMAGE is live (rollback: set XINFERENCE_IMAGE in $DEPLOY_DIR/.env to a previous tag, then docker compose up -d --force-recreate xinference xinference-worker xinference-wheels)"
