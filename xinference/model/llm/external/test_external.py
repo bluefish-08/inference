@@ -109,3 +109,9 @@ if __name__ == "__main__":
     test_load_requires_endpoint()
     test_forwards_and_streams()
     print("EXTERNAL_OK")
+
+
+def test_allow_batch_is_enabled():
+    # ModelActor serialises every request behind a lock when this is False,
+    # which silently caps the remote endpoint at one concurrent request.
+    assert ExternalChatModel.allow_batch is True

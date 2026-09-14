@@ -50,6 +50,10 @@ _INTERNAL_PARAMS = frozenset({"lora_name", "request_id", "stream_interval", "ech
 
 
 class ExternalChatModel(LLM):
+    # The remote server does its own continuous batching; without this the model
+    # actor wraps every request in a global asyncio.Lock and serialises them.
+    allow_batch = True
+
     def __init__(
         self,
         model_uid: str,
