@@ -133,8 +133,16 @@ async def test_anthropic_x_api_key_records_inference_audit(
         "client_ip": "127.0.0.1",
         "category": "inference",
         "auth_type": "api_key",
+        "usage": recorded[0]["usage"],
     }
     assert recorded[0]["latency_ms"] >= 0
+    # A denied call never reaches the response body, so it carries no usage;
+    # an allowed one is recorded by the middleware, which knows it was not a
+    # stream even when the body yielded no usage chunk.
+    if expected_audit_status == "denied":
+        assert recorded[0]["usage"] is None
+    else:
+        assert recorded[0]["usage"] == {"stream": False}
     requests_total.inc.assert_called_once_with(
         {
             "user": "anthropic-user",

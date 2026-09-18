@@ -155,6 +155,7 @@ def record_audit_event(
     address: str = "",
     category: str = "",
     auth_type: str = "",
+    usage: Optional[dict] = None,
 ) -> None:
     if should_skip_audit(endpoint):
         return
@@ -181,4 +182,8 @@ def record_audit_event(
         "node": node or _NODE_NAME,
         "address": address,
     }
+    # ttft_ms / prompt_tokens / completion_tokens / output_tps / stream, absent
+    # on calls that produce none of them (admin routes, embeddings, failures).
+    if usage:
+        entry.update(usage)
     _get_audit_logger().info(json.dumps(entry, ensure_ascii=False))

@@ -57,6 +57,7 @@ async def _search(audit_path, **kwargs) -> Dict[str, Any]:
         api_key_name="",
         model_id="",
         model_name="",
+        model="",
         model_type="",
         category="",
         auth_type="",
@@ -262,3 +263,33 @@ async def test_es_mode_uses_case_insensitive_wildcard(monkeypatch):
         assert query["case_insensitive"] is True
         # user-typed `*` is escaped rather than treated as a wildcard
         assert query["value"] == r"*Sense\*Voice*"
+
+
+@pytest.mark.asyncio
+async def test_model_filter_matches_uid_or_name(audit_log):
+    """One box has to cover both fields.
+
+    Audit lines written before a model finished loading carry an empty
+    model_name, so a name-only filter would hide exactly the rows an operator
+    is looking for.
+    """
+    by_name = await _search(audit_log, model="qwen2.5-instruct")
+    assert by_name["total"] == 1
+
+    by_uid = await _search(audit_log, model="abc123")
+    assert by_uid["total"] == 1
+    assert by_uid["hits"][0]["model_id"] == "qwen2.5-instruct-abc123"
+
+    assert (await _search(audit_log, model="nothing-matches"))["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_model_filter_finds_entry_with_blank_model_name(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    entry = dict(ENTRIES[1], model_name="", model_id="deepseek-v4-flash-vision")
+    (log_dir / "audit.log").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    monkeypatch.setattr("xinference.constants.XINFERENCE_LOG_DIR", str(log_dir))
+    monkeypatch.delenv("XINFERENCE_ES_URL", raising=False)
+
+    assert (await _search(log_dir, model="deepseek"))["total"] == 1

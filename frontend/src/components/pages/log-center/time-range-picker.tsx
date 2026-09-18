@@ -34,7 +34,7 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
   const canApplyAbsoluteRange = hasAbsoluteRange && !absoluteRangeInvalid;
   const triggerLabel = isAbsoluteRange
     ? `${formatDateTime(value.from)} ~ ${formatDateTime(value.to)}`
-    : t(selectedRelativeRange?.labelKey || 'monitorCenter.time.1h');
+    : t(selectedRelativeRange?.labelKey || 'timePicker.time.1h');
 
   const handleApplyAbsoluteRange = () => {
     if (!canApplyAbsoluteRange) return;
@@ -67,7 +67,7 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
         <div className="grid max-h-[28rem] grid-cols-1 overflow-hidden sm:grid-cols-[18rem_12rem]">
           <div className="border-b p-4 sm:border-b-0 sm:border-r">
             <div className="mb-4 text-sm font-medium text-muted-foreground">
-              {t('monitorCenter.absoluteRange')}
+              {t('timePicker.absoluteRange')}
             </div>
             <div className="space-y-3">
               <DateTimePicker
@@ -89,7 +89,7 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
               />
               {absoluteRangeInvalid && (
                 <div className="text-xs text-destructive">
-                  {t('monitorCenter.invalidTimeRange')}
+                  {t('timePicker.invalidTimeRange')}
                 </div>
               )}
               <Button
@@ -97,7 +97,7 @@ export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
                 disabled={!canApplyAbsoluteRange}
                 onClick={handleApplyAbsoluteRange}
               >
-                {t('monitorCenter.applyTimeRange')}
+                {t('timePicker.applyTimeRange')}
               </Button>
             </div>
           </div>

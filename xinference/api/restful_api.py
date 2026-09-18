@@ -350,13 +350,23 @@ class RESTfulAPI(CancelMixin):
     # Add new class attributes
     _allowed_ip_list: Optional[List[ipaddress.IPv4Network]] = None
     QWEN38_REASONING_EFFORTS = {"xhigh", "medium", "low"}
+    _cluster_metrics_enabled = False
     QWEN38_REASONING_MODEL_NAMES = {"qwen3.8", "qwen3.8-max"}
 
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
+        # Must start here, not via on_event("startup"): passing lifespan= to
+        # FastAPI makes Starlette ignore on_event handlers entirely.
+        metrics_task = (
+            asyncio.create_task(self._cluster_metrics_update_loop())
+            if self._cluster_metrics_enabled
+            else None
+        )
         try:
             yield
         finally:
+            if metrics_task is not None:
+                metrics_task.cancel()
             await self._close_token_router_client()
 
     def __init__(
@@ -498,6 +508,7 @@ class RESTfulAPI(CancelMixin):
         model_type: str,
         status: str,
         latency_s: float = 0.0,
+        usage: Optional[dict] = None,
     ):
         if not self._advanced_auth_service:
             return
@@ -533,6 +544,7 @@ class RESTfulAPI(CancelMixin):
             endpoint=request.url.path,
             status=status,
             latency_ms=round(latency_s * 1000, 1),
+            usage=usage,
             client_ip=request.client.host if request.client else "",
             category="inference",
             auth_type="api_key",
@@ -591,7 +603,6 @@ class RESTfulAPI(CancelMixin):
         response = await call_next(request)
         model_uid = getattr(request.state, "_audit_model_uid", "")
         if model_uid:
-            latency_s = time.perf_counter() - started
             if response.status_code < 400:
                 audit_status = "success"
             elif response.status_code == 404:
@@ -599,7 +610,49 @@ class RESTfulAPI(CancelMixin):
             else:
                 audit_status = "error"
             model_type = getattr(request.state, "_audit_model_type", "")
-            self._record_audit(request, model_uid, model_type, audit_status, latency_s)
+            body_iterator = getattr(response, "body_iterator", None)
+            if body_iterator is None:
+                self._record_audit(
+                    request,
+                    model_uid,
+                    model_type,
+                    audit_status,
+                    time.perf_counter() - started,
+                )
+            else:
+                # call_next returns as soon as the response starts, so for a
+                # stream `started` alone would time the handler, not the answer.
+                from .stream_probe import StreamStats, probe_body
+
+                stats = StreamStats()
+
+                async def _probed():
+                    try:
+                        async for chunk in probe_body(
+                            body_iterator,
+                            stats,
+                            request_start=started,
+                            drop_usage_chunk=getattr(
+                                request.state, "_strip_usage_chunk", False
+                            ),
+                        ):
+                            yield chunk
+                    finally:
+                        self._record_audit(
+                            request,
+                            model_uid,
+                            model_type,
+                            audit_status,
+                            stats.duration_ms / 1000,
+                            usage={
+                                **stats.as_audit_fields(),
+                                "stream": bool(
+                                    getattr(request.state, "_audit_stream", False)
+                                ),
+                            },
+                        )
+
+                response.body_iterator = _probed()
         elif self._advanced_auth_service and request.url.path.startswith(
             ("/v1/models", "/v1/admin", "/v1/token_routers")
         ):
@@ -910,13 +963,7 @@ class RESTfulAPI(CancelMixin):
             self._app.add_middleware(MetricsMiddleware)
             self._app.include_router(self._router)
             self._app.add_route("/metrics", metrics)
-
-            # Start background task to periodically refresh cluster metrics
-            @self._app.on_event("startup")
-            async def _start_cluster_metrics_updater():
-                import asyncio
-
-                asyncio.create_task(self._cluster_metrics_update_loop())
+            self._cluster_metrics_enabled = True
 
         # Check all the routes returns Response.
         # This is to avoid `jsonable_encoder` performance issue:
@@ -1702,6 +1749,27 @@ class RESTfulAPI(CancelMixin):
             return ex
         return e
 
+    @staticmethod
+    def _force_usage_accounting(request, raw_body: dict, *targets: dict) -> None:
+        """Make streaming responses carry a final usage chunk, for accounting.
+
+        stream_options.include_usage defaults to False, so without this the
+        audit trail has no token counts for the majority of streaming calls.
+        The extra chunk is stripped back out in the audit middleware unless the
+        client asked for it, keeping the wire format unchanged.
+        """
+        if not raw_body.get("stream"):
+            return
+        request.state._audit_stream = True
+        options = raw_body.get("stream_options")
+        options = options if isinstance(options, dict) else {}
+        if options.get("include_usage"):
+            return
+        request.state._strip_usage_chunk = True
+        forced = {**options, "include_usage": True}
+        for target in targets:
+            target["stream_options"] = forced
+
     async def create_completion(self, request: Request) -> Response:
         raw_body = await request.json()
         body = CreateCompletionRequest.parse_obj(raw_body)
@@ -1716,6 +1784,7 @@ class RESTfulAPI(CancelMixin):
         }
         raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
+        self._force_usage_accounting(request, raw_body, raw_kwargs, kwargs)
 
         # guided_decoding params
         kwargs.update(self.extract_guided_params(raw_body=raw_body))
@@ -3371,6 +3440,7 @@ class RESTfulAPI(CancelMixin):
 
         raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
+        self._force_usage_accounting(request, raw_body, raw_kwargs, kwargs)
 
         enable_thinking = raw_body.get("enable_thinking")
         if enable_thinking is None:

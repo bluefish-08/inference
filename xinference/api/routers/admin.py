@@ -1282,6 +1282,96 @@ def _match_enum(stored: Any, allowed: set) -> bool:
     return stored.lower() in allowed
 
 
+def _audit_log_paths() -> list[str]:
+    """Current audit.log plus its rotated siblings, oldest first."""
+    import glob
+
+    from ...constants import XINFERENCE_LOG_DIR
+
+    base = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
+    return sorted(path for path in glob.glob(base + "*") if os.path.isfile(path))
+
+
+def _iter_audit_entries(
+    *,
+    time_from: str,
+    time_to: str,
+    user: str = "",
+    api_key_name: str = "",
+    model_id: str = "",
+    model_name: str = "",
+    model: str = "",
+    model_type: str = "",
+    category: str = "",
+    auth_type: str = "",
+    status: str = "",
+    client_ip: str = "",
+) -> list[dict]:
+    """Read audit.log and its rotated files, returning the matching entries."""
+    t_from = _parse_relative_time(time_from)
+    t_to = _parse_relative_time(time_to)
+
+    def _enum_set(value: str) -> set:
+        return {v.strip().lower() for v in value.split(",") if v.strip()}
+
+    enum_filters = [
+        ("status", _enum_set(status)),
+        ("category", _enum_set(category)),
+        ("model_type", _enum_set(model_type)),
+        ("auth_type", _enum_set(auth_type)),
+    ]
+    text_filters = [
+        ("user", user),
+        ("api_key_name", api_key_name),
+        ("model_id", model_id),
+        ("model_name", model_name),
+        ("client_ip", client_ip),
+    ]
+
+    results: list[dict] = []
+    for path in _audit_log_paths():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    # A line may be valid JSON yet not an object (e.g. `null`,
+                    # `[1,2]`); `entry.get(...)` below would raise AttributeError.
+                    if not isinstance(entry, dict):
+                        continue
+                    if not _audit_entry_in_time_range(entry, t_from, t_to):
+                        continue
+                    if not all(
+                        _match_substring(entry.get(field), needle)
+                        for field, needle in text_filters
+                        if needle
+                    ):
+                        continue
+                    if not all(
+                        _match_enum(entry.get(field), allowed)
+                        for field, allowed in enum_filters
+                        if allowed
+                    ):
+                        continue
+                    # One box for the model: entries written before a model
+                    # finished loading carry only the uid, so matching just
+                    # model_name would silently hide them.
+                    if model and not (
+                        _match_substring(entry.get("model_name"), model)
+                        or _match_substring(entry.get("model_id"), model)
+                    ):
+                        continue
+                    results.append(entry)
+        except OSError:
+            continue
+    return results
+
+
 async def _search_audit_from_file(
     *,
     time_from: str,
@@ -1290,6 +1380,7 @@ async def _search_audit_from_file(
     api_key_name: str,
     model_id: str,
     model_name: str,
+    model: str,
     model_type: str,
     category: str,
     auth_type: str,
@@ -1299,89 +1390,21 @@ async def _search_audit_from_file(
     size: int,
 ) -> JSONResponse:
     """Fallback: search audit events from local audit.log file."""
-    from ...constants import XINFERENCE_LOG_DIR
-
-    audit_path = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
-    if not os.path.exists(audit_path):
-        return JSONResponse(content={"hits": [], "total": 0})
-
-    t_from = _parse_relative_time(time_from)
-    t_to = _parse_relative_time(time_to)
-
-    status_set = (
-        {v.strip().lower() for v in status.split(",") if v.strip()} if status else set()
+    results = await asyncio.to_thread(
+        _iter_audit_entries,
+        time_from=time_from,
+        time_to=time_to,
+        user=user,
+        api_key_name=api_key_name,
+        model_id=model_id,
+        model_name=model_name,
+        model=model,
+        model_type=model_type,
+        category=category,
+        auth_type=auth_type,
+        status=status,
+        client_ip=client_ip,
     )
-    category_set = (
-        {v.strip().lower() for v in category.split(",") if v.strip()}
-        if category
-        else set()
-    )
-    model_type_set = (
-        {v.strip().lower() for v in model_type.split(",") if v.strip()}
-        if model_type
-        else set()
-    )
-    auth_type_set = (
-        {v.strip().lower() for v in auth_type.split(",") if v.strip()}
-        if auth_type
-        else set()
-    )
-
-    results: list[dict] = []
-    try:
-        with open(audit_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                # A line may be valid JSON yet not an object (e.g. `null`,
-                # `[1,2]`); `entry.get(...)` below would raise AttributeError.
-                if not isinstance(entry, dict):
-                    continue
-
-                ts_str = entry.get("@timestamp", "")
-                if t_from or t_to:
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except (ValueError, TypeError):
-                        continue
-                    if t_from and ts < t_from:
-                        continue
-                    if t_to and ts > t_to:
-                        continue
-
-                if not all(
-                    _match_substring(entry.get(field), needle)
-                    for field, needle in (
-                        ("user", user),
-                        ("api_key_name", api_key_name),
-                        ("model_id", model_id),
-                        ("model_name", model_name),
-                        ("client_ip", client_ip),
-                    )
-                    if needle
-                ):
-                    continue
-                if not all(
-                    _match_enum(entry.get(field), allowed)
-                    for field, allowed in (
-                        ("status", status_set),
-                        ("category", category_set),
-                        ("model_type", model_type_set),
-                        ("auth_type", auth_type_set),
-                    )
-                    if allowed
-                ):
-                    continue
-
-                results.append(entry)
-    except OSError:
-        return JSONResponse(content={"hits": [], "total": 0})
-
     results.sort(key=lambda x: x.get("@timestamp", ""), reverse=True)
     total = len(results)
     hits = results[page_from : page_from + size]
@@ -1391,9 +1414,6 @@ async def _search_audit_from_file(
 async def _list_audit_filter_options_from_file(
     *, time_from: str, time_to: str
 ) -> JSONResponse:
-    from ...constants import XINFERENCE_LOG_DIR
-
-    audit_path = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
     t_from = _parse_relative_time(time_from)
     t_to = _parse_relative_time(time_to)
 
@@ -1404,23 +1424,26 @@ async def _list_audit_filter_options_from_file(
         seen: dict[str, set[str]] = {
             field_name: set() for field_name in _AUDIT_TEXT_FILTER_FIELDS
         }
-        try:
-            with open(audit_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    if not _audit_entry_in_time_range(entry, t_from, t_to):
-                        continue
-                    for field_name in _AUDIT_TEXT_FILTER_FIELDS:
-                        _add_bounded_audit_filter_option(
-                            options[field_name], seen[field_name], entry.get(field_name)
-                        )
-        except OSError:
-            return {key: [] for key in options}
+        for audit_path in _audit_log_paths():
+            try:
+                with open(audit_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        if not _audit_entry_in_time_range(entry, t_from, t_to):
+                            continue
+                        for field_name in _AUDIT_TEXT_FILTER_FIELDS:
+                            _add_bounded_audit_filter_option(
+                                options[field_name],
+                                seen[field_name],
+                                entry.get(field_name),
+                            )
+            except OSError:
+                continue
 
         return {key: [value for _, value in values] for key, values in options.items()}
 
@@ -1533,6 +1556,7 @@ async def search_audit_logs(
     api_key_name: str = "",
     model_id: str = "",
     model_name: str = "",
+    model: str = "",
     model_type: str = "",
     category: str = "",
     auth_type: str = "",
@@ -1550,6 +1574,7 @@ async def search_audit_logs(
             api_key_name=api_key_name,
             model_id=model_id,
             model_name=model_name,
+            model=model,
             model_type=model_type,
             category=category,
             auth_type=auth_type,
@@ -1593,6 +1618,19 @@ async def search_audit_logs(
             # template mapping these fields directly to the `wildcard` type
             # (ES >= 7.9), which is covered by the first alternative.
             filter_clauses.append(_es_substring_clause(field_name, value))
+
+    if model:
+        filter_clauses.append(
+            {
+                "bool": {
+                    "should": [
+                        _es_substring_clause("model_name", model),
+                        _es_substring_clause("model_id", model),
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
 
     for field_name, value in [
         ("model_type", model_type),
@@ -1642,6 +1680,263 @@ async def search_audit_logs(
     return JSONResponse(content={"hits": hits, "total": total})
 
 
+_AUDIT_STATS_INTERVALS = (
+    (timedelta(hours=3), timedelta(minutes=5), "5m"),
+    (timedelta(hours=12), timedelta(minutes=15), "15m"),
+    (timedelta(days=2), timedelta(hours=1), "1h"),
+    (timedelta(days=14), timedelta(hours=6), "6h"),
+)
+
+
+def _pick_stats_interval(span: timedelta) -> tuple[timedelta, str]:
+    for limit, step, label in _AUDIT_STATS_INTERVALS:
+        if span <= limit:
+            return step, label
+    return timedelta(days=1), "1d"
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = int(round((len(sorted_values) - 1) * q))
+    return round(sorted_values[min(index, len(sorted_values) - 1)], 1)
+
+
+def _latency_summary(values: list[float]) -> dict[str, float]:
+    values = sorted(values)
+    return {
+        "avg": round(sum(values) / len(values), 1) if values else 0.0,
+        "p50": _percentile(values, 0.5),
+        "p95": _percentile(values, 0.95),
+        "p99": _percentile(values, 0.99),
+        "max": round(values[-1], 1) if values else 0.0,
+    }
+
+
+def _group_slot(entry: dict, step_seconds: int) -> Optional[int]:
+    try:
+        timestamp = datetime.fromisoformat(
+            str(entry.get("@timestamp", "")).replace("Z", "+00:00")
+        )
+    except (ValueError, TypeError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return int(timestamp.timestamp()) // step_seconds * step_seconds
+
+
+class _Group:
+    """Running totals for one model or one API key."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.count = 0
+        self.errors = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.latencies: list[float] = []
+        self.ttfts: list[float] = []
+        self.speeds: list[float] = []
+        self.members: set[str] = set()
+        self.buckets: dict[int, int] = {}
+        self.labels: dict[str, str] = {}
+
+    def add(self, entry: dict, *, ok: bool, slot: Optional[int]) -> None:
+        self.count += 1
+        if not ok:
+            self.errors += 1
+        for field, bucket in (
+            ("latency_ms", self.latencies),
+            ("ttft_ms", self.ttfts),
+            ("output_tps", self.speeds),
+        ):
+            value = entry.get(field)
+            # Total duration only means something for a streamed answer here;
+            # a non-streaming call's duration is dominated by output length.
+            if field == "latency_ms" and entry.get("stream") is not True:
+                continue
+            if isinstance(value, (int, float)):
+                bucket.append(float(value))
+        for field in ("prompt_tokens", "completion_tokens"):
+            value = entry.get(field)
+            if isinstance(value, int):
+                setattr(self, field, getattr(self, field) + value)
+        if slot is not None:
+            self.buckets[slot] = self.buckets.get(slot, 0) + 1
+
+    def as_row(self, *, total: int, member_field: str, slots: list[int]) -> dict:
+        return {
+            "key": self.key,
+            "count": self.count,
+            "share": round(self.count / total * 100, 1) if total else 0.0,
+            "errors": self.errors,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            member_field: len(self.members),
+            "latency": _latency_summary(self.latencies),
+            "ttft": _latency_summary(self.ttfts),
+            "tps": _latency_summary(self.speeds),
+            "series": [self.buckets.get(slot, 0) for slot in slots],
+            **self.labels,
+        }
+
+
+def _compute_audit_stats(
+    entries: list[dict], *, t_from: datetime, t_to: datetime, top_n: int
+) -> dict[str, Any]:
+    step, step_label = _pick_stats_interval(t_to - t_from)
+    step_seconds = int(step.total_seconds())
+
+    latencies: list[float] = []
+    ttfts: list[float] = []
+    speeds: list[float] = []
+    prompt_tokens = 0
+    completion_tokens = 0
+    users: set[str] = set()
+    api_keys: set[str] = set()
+    models: set[str] = set()
+    errors = 0
+    buckets: dict[int, list[int]] = {}
+    by_model: dict[str, _Group] = {}
+    by_api_key: dict[str, _Group] = {}
+
+    for entry in entries:
+        ok = entry.get("status") == "success"
+        if not ok:
+            errors += 1
+
+        latency = entry.get("latency_ms")
+        if isinstance(latency, (int, float)) and entry.get("stream") is True:
+            latencies.append(float(latency))
+        for field, samples in (("ttft_ms", ttfts), ("output_tps", speeds)):
+            value = entry.get(field)
+            if isinstance(value, (int, float)):
+                samples.append(float(value))
+        for field, bucket_name in (
+            ("prompt_tokens", "prompt"),
+            ("completion_tokens", "completion"),
+        ):
+            value = entry.get(field)
+            if isinstance(value, int):
+                if bucket_name == "prompt":
+                    prompt_tokens += value
+                else:
+                    completion_tokens += value
+
+        user = str(entry.get("user") or "")
+        model = str(entry.get("model_name") or entry.get("model_id") or "")
+        api_key = str(entry.get("api_key_name") or user or "")
+        if user:
+            users.add(user)
+        if model:
+            models.add(model)
+        if api_key:
+            api_keys.add(api_key)
+
+        slot = _group_slot(entry, step_seconds)
+        if slot is not None:
+            bucket = buckets.setdefault(slot, [0, 0])
+            bucket[0] += 1
+            if not ok:
+                bucket[1] += 1
+
+        if model:
+            group = by_model.setdefault(model, _Group(model))
+            group.add(entry, ok=ok, slot=slot)
+            if api_key:
+                group.members.add(api_key)
+            group.labels.setdefault("model_type", str(entry.get("model_type") or ""))
+        if api_key:
+            group = by_api_key.setdefault(api_key, _Group(api_key))
+            group.add(entry, ok=ok, slot=slot)
+            if model:
+                group.members.add(model)
+            group.labels["user"] = user
+            group.labels["client_ip"] = str(entry.get("client_ip") or "")
+
+    start_slot = int(t_from.timestamp()) // step_seconds * step_seconds
+    end_slot = int(t_to.timestamp()) // step_seconds * step_seconds
+    slots = list(range(start_slot, end_slot + step_seconds, step_seconds))
+    series = [
+        {
+            "ts": datetime.fromtimestamp(slot, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "count": buckets.get(slot, (0, 0))[0],
+            "errors": buckets.get(slot, (0, 0))[1],
+        }
+        for slot in slots
+    ]
+
+    def _rows(groups: dict[str, _Group], member_field: str) -> list[dict]:
+        rows = [
+            group.as_row(total=len(entries), member_field=member_field, slots=slots)
+            for group in groups.values()
+        ]
+        rows.sort(key=lambda row: row["count"], reverse=True)
+        return rows[:top_n]
+
+    return {
+        "total": len(entries),
+        "errors": errors,
+        "unique_users": len(users),
+        "unique_api_keys": len(api_keys),
+        "unique_models": len(models),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "latency": _latency_summary(latencies),
+        "ttft": _latency_summary(ttfts),
+        "tps": _latency_summary(speeds),
+        "interval": step_label,
+        "series": series,
+        "by_model": _rows(by_model, "api_keys"),
+        "by_api_key": _rows(by_api_key, "models"),
+    }
+
+
+async def get_audit_stats(
+    time_from: str = "now-24h",
+    time_to: str = "now",
+    user: str = "",
+    api_key_name: str = "",
+    model_name: str = "",
+    model: str = "",
+    model_type: str = "",
+    category: str = "inference",
+    status: str = "",
+    client_ip: str = "",
+    top_n: int = 10,
+) -> JSONResponse:
+    """Aggregate audit.log into call-volume / user / model / latency stats.
+
+    Reads the local audit log even when ES is configured; the ES path has no
+    aggregation implementation yet.
+    """
+    t_from = _parse_relative_time(time_from) or (
+        datetime.now(timezone.utc) - timedelta(days=1)
+    )
+    t_to = _parse_relative_time(time_to) or datetime.now(timezone.utc)
+    top_n = max(1, min(top_n, 100))
+
+    entries = await asyncio.to_thread(
+        _iter_audit_entries,
+        time_from=time_from,
+        time_to=time_to,
+        user=user,
+        api_key_name=api_key_name,
+        model_name=model_name,
+        model=model,
+        model_type=model_type,
+        category=category,
+        status=status,
+        client_ip=client_ip,
+    )
+    content = await asyncio.to_thread(
+        _compute_audit_stats, entries, t_from=t_from, t_to=t_to, top_n=top_n
+    )
+    return JSONResponse(content=content)
+
+
 # --- Route registration (original) ---
 
 
@@ -1650,7 +1945,14 @@ def register_routes(api: "RESTfulAPI") -> None:
     auth = api._auth_service
     is_auth = api.is_authenticated()
 
-    router.add_api_route("/status", get_status, methods=["GET"])
+    # Leaks worker addresses, host memory and per-GPU usage; the compose
+    # healthcheck must not target it once this is gated.
+    router.add_api_route(
+        "/status",
+        get_status,
+        methods=["GET"],
+        dependencies=([Security(auth, scopes=["admin"])] if is_auth else None),
+    )
     router.add_api_route("/v1/address", get_address, methods=["GET"])
     router.add_api_route("/v1/cluster/auth", is_cluster_authenticated, methods=["GET"])
     router.add_api_route("/v1/cluster/ui_config", get_ui_config, methods=["GET"])
@@ -1834,6 +2136,13 @@ def register_routes(api: "RESTfulAPI") -> None:
     router.add_api_route(
         "/v1/audit/search",
         search_audit_logs,
+        methods=["GET"],
+        dependencies=([Security(auth, scopes=["admin"])] if is_auth else None),
+    )
+
+    router.add_api_route(
+        "/v1/audit/stats",
+        get_audit_stats,
         methods=["GET"],
         dependencies=([Security(auth, scopes=["admin"])] if is_auth else None),
     )

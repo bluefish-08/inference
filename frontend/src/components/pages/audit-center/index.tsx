@@ -6,22 +6,18 @@ import {
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
-  CircleAlert,
   Copy,
-  FileSearch,
   Filter,
   KeyRound,
   Loader2,
   RefreshCw,
   RotateCcw,
-  ShieldCheck,
   UserRound,
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { AutoComplete } from '@/components/ui/auto-complete';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { JSONSyntaxHighlighter } from '@/components/ui/json-syntax-highlighter';
@@ -39,7 +35,7 @@ import {
 } from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { DEFAULT_LOG_TIME_RANGE, LOG_REFRESH_OPTIONS } from '@/constants/logs';
-import { useI18n } from '@/contexts/i18n-context';
+import { type TFunc, useI18n } from '@/contexts/i18n-context';
 import request from '@/lib/request';
 import { cn, copyToClipboard } from '@/lib/utils';
 
@@ -47,6 +43,17 @@ import { TimeRangePicker } from '../log-center/time-range-picker';
 import type { TimeRangeValue } from '../log-center/types';
 
 const AUDIT_PAGE_SIZE = 50;
+
+// Milliseconds stop being readable somewhere around a second; a 93K-token
+// prefill reads as "28.40 s", not "28402 ms".
+const DURATION_SECONDS_FROM_MS = 1000;
+
+const formatDuration = (ms: unknown, t: TFunc): string => {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '-';
+  return ms >= DURATION_SECONDS_FROM_MS
+    ? t('auditCenter.latencySeconds', { value: (ms / 1000).toFixed(2) })
+    : t('auditCenter.latencyMs', { value: Math.round(ms) });
+};
 
 interface AuditRecord {
   '@timestamp'?: string;
@@ -62,6 +69,11 @@ interface AuditRecord {
   endpoint?: string;
   status?: string;
   latency_ms?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  ttft_ms?: number;
+  output_tps?: number;
+  stream?: boolean;
   client_ip?: string;
   node?: string;
   address?: string;
@@ -84,8 +96,7 @@ interface AuditFilterOptionsResponse {
 interface AuditFilters {
   user: string;
   apiKeyName: string;
-  modelId: string;
-  modelName: string;
+  model: string;
   modelType: string[];
   category: string[];
   authType: string;
@@ -94,16 +105,15 @@ interface AuditFilters {
 }
 
 type AuditFilterKey = keyof AuditFilters;
-type AuditTextFilterKey = 'user' | 'apiKeyName' | 'modelId' | 'modelName' | 'clientIp';
+type AuditTextFilterKey = 'user' | 'apiKeyName' | 'model' | 'clientIp';
 type AuditMultiFilterKey = 'modelType' | 'category' | 'status';
 
 const defaultFilters: AuditFilters = {
   user: '',
   apiKeyName: '',
-  modelId: '',
-  modelName: '',
+  model: '',
   modelType: [],
-  category: [],
+  category: ['inference'],
   authType: '',
   status: [],
   clientIp: '',
@@ -112,8 +122,7 @@ const defaultFilters: AuditFilters = {
 const defaultTextFilters = {
   user: '',
   apiKeyName: '',
-  modelId: '',
-  modelName: '',
+  model: '',
   clientIp: '',
 };
 
@@ -128,8 +137,7 @@ const defaultFilterOptions: Required<AuditFilterOptionsResponse> = {
 const filterParamMap: Record<AuditFilterKey, string> = {
   user: 'user',
   apiKeyName: 'api_key_name',
-  modelId: 'model_id',
-  modelName: 'model_name',
+  model: 'model',
   modelType: 'model_type',
   category: 'category',
   authType: 'auth_type',
@@ -366,45 +374,6 @@ export default function AuditCenter() {
     };
   }, [timeRange]);
 
-  const stats = useMemo(() => {
-    const successCount = records.filter((record) => record.status === 'success').length;
-    const riskCount = records.filter(
-      (record) => record.status && record.status !== 'success'
-    ).length;
-    const apiKeyCount = records.filter((record) => record.auth_type === 'api_key').length;
-
-    return [
-      {
-        label: t('auditCenter.totalEvents'),
-        value: total,
-        detail: t('auditCenter.matchingRecords'),
-        Icon: FileSearch,
-        tone: 'bg-sky-500/10 text-sky-600',
-      },
-      {
-        label: t('auditCenter.successEvents'),
-        value: successCount,
-        detail: t('auditCenter.currentPage'),
-        Icon: ShieldCheck,
-        tone: 'bg-emerald-500/10 text-emerald-600',
-      },
-      {
-        label: t('auditCenter.riskEvents'),
-        value: riskCount,
-        detail: t('auditCenter.currentPage'),
-        Icon: CircleAlert,
-        tone: 'bg-rose-500/10 text-rose-600',
-      },
-      {
-        label: t('auditCenter.apiKeyEvents'),
-        value: apiKeyCount,
-        detail: t('auditCenter.currentPage'),
-        Icon: KeyRound,
-        tone: 'bg-violet-500/10 text-violet-600',
-      },
-    ];
-  }, [records, t, total]);
-
   const setTextFilter = (key: AuditTextFilterKey, value?: string) => {
     setDraftFilters((current) => ({ ...current, [key]: value || '' }));
   };
@@ -429,6 +398,12 @@ export default function AuditCenter() {
     if (!value) return t(`${prefix}.unknown`);
     return knownValues.includes(value) ? t(`${prefix}.${value}`) : value;
   };
+
+  // Pinned to inference these columns repeat the same value on every row; they
+  // come back the moment admin/auth rows are in view, where endpoint is the
+  // only thing telling two rows apart.
+  const showAuditColumns = !(filters.category.length === 1 && filters.category[0] === 'inference');
+  const columnCount = showAuditColumns ? 11 : 9;
 
   const hasFilters = Object.values(filters).some((value) =>
     Array.isArray(value) ? value.length > 0 : Boolean(value)
@@ -498,26 +473,7 @@ export default function AuditCenter() {
         </div>
       }
     >
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {stats.map(({ label, value, detail, Icon, tone }) => (
-          <Card key={label} className="rounded-lg py-5 shadow-none">
-            <CardContent className="flex items-center gap-4">
-              <div className={cn('flex h-11 w-11 items-center justify-center rounded-lg', tone)}>
-                <Icon className="h-5 w-5" />
-              </div>
-              <div className="min-w-0">
-                <div className="text-sm text-muted-foreground">{label}</div>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold">{value}</span>
-                  <span className="text-xs text-muted-foreground">{detail}</span>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      <div className="mt-6 rounded-lg border bg-card">
+      <div className="flex min-h-[calc(100vh-11rem)] flex-col rounded-lg border bg-card">
         <div className="border-b p-5">
           <div className="mb-4 flex items-center justify-between gap-3">
             <div className="flex items-center gap-2 font-semibold">
@@ -534,7 +490,7 @@ export default function AuditCenter() {
               {t('auditCenter.resetFilters')}
             </Button>
           </div>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(150px,1fr))]">
             <FilterTextSelect
               label={t('auditCenter.user')}
               value={draftFilters.user}
@@ -550,18 +506,13 @@ export default function AuditCenter() {
               onChange={(value) => setTextFilter('apiKeyName', value)}
             />
             <FilterTextSelect
-              label={t('auditCenter.modelId')}
-              value={draftFilters.modelId}
-              values={filterOptions.model_id}
-              placeholder={t('auditCenter.modelIdPlaceholder')}
-              onChange={(value) => setTextFilter('modelId', value)}
-            />
-            <FilterTextSelect
-              label={t('auditCenter.modelName')}
-              value={draftFilters.modelName}
-              values={filterOptions.model_name}
-              placeholder={t('auditCenter.modelNamePlaceholder')}
-              onChange={(value) => setTextFilter('modelName', value)}
+              label={t('auditCenter.model')}
+              value={draftFilters.model}
+              values={[...new Set([...filterOptions.model_name, ...filterOptions.model_id])]
+                .filter(Boolean)
+                .sort()}
+              placeholder={t('auditCenter.modelPlaceholder')}
+              onChange={(value) => setTextFilter('model', value)}
             />
             <FilterTextSelect
               label={t('auditCenter.clientIp')}
@@ -605,25 +556,35 @@ export default function AuditCenter() {
           </div>
         </div>
 
-        <div className="overflow-hidden">
-          <Table className="w-max min-w-full">
+        <div className="flex-1 overflow-auto">
+          <Table className="w-max min-w-full [&_td]:py-2.5">
             <TableHeader>
-              <TableRow>
-                <TableHead className="w-48">{t('auditCenter.time')}</TableHead>
-                <TableHead className="w-28">{t('auditCenter.category')}</TableHead>
-                <TableHead className="w-44">{t('auditCenter.identity')}</TableHead>
-                <TableHead>{t('auditCenter.endpoint')}</TableHead>
-                <TableHead>{t('auditCenter.apiKeyNameColumn')}</TableHead>
-                <TableHead className="w-44">{t('auditCenter.model')}</TableHead>
-                <TableHead>{t('auditCenter.modelIdColumn')}</TableHead>
-                <TableHead className="w-32">{t('auditCenter.status')}</TableHead>
+              <TableRow className="[&_th]:text-[11px] [&_th]:font-semibold [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                <TableHead className="w-44">{t('auditCenter.time')}</TableHead>
+                {showAuditColumns && (
+                  <TableHead className="w-28">{t('auditCenter.category')}</TableHead>
+                )}
+
+                {showAuditColumns && <TableHead>{t('auditCenter.endpoint')}</TableHead>}
+                <TableHead className="w-52">{t('auditCenter.apiKeyNameColumn')}</TableHead>
+                <TableHead className="w-56">{t('auditCenter.model')}</TableHead>
+                <TableHead className="w-20 text-right">{t('auditCenter.promptTokens')}</TableHead>
+                <TableHead className="w-20 text-right">
+                  {t('auditCenter.completionTokens')}
+                </TableHead>
+                <TableHead className="w-24 text-right">{t('auditCenter.ttft')}</TableHead>
                 <TableHead className="w-28 text-right">{t('auditCenter.latency')}</TableHead>
+                <TableHead className="w-28 text-right">{t('auditCenter.speed')}</TableHead>
+                <TableHead className="w-32">{t('auditCenter.status')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-20 text-center text-muted-foreground">
+                  <TableCell
+                    colSpan={columnCount}
+                    className="py-20 text-center text-muted-foreground"
+                  >
                     <div className="flex items-center justify-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
                       {t('auditCenter.loading')}
@@ -632,7 +593,10 @@ export default function AuditCenter() {
                 </TableRow>
               ) : records.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-20 text-center text-muted-foreground">
+                  <TableCell
+                    colSpan={columnCount}
+                    className="py-20 text-center text-muted-foreground"
+                  >
                     {t('auditCenter.noRecords')}
                   </TableCell>
                 </TableRow>
@@ -643,19 +607,32 @@ export default function AuditCenter() {
                     className="cursor-pointer"
                     onClick={() => setSelectedRecord(record)}
                   >
-                    <TableCell className="whitespace-nowrap text-sm">
+                    <TableCell className="whitespace-nowrap font-mono text-xs text-muted-foreground">
                       {formatAuditTime(record['@timestamp'])}
                     </TableCell>
-                    <TableCell>
-                      <Badge className={categoryTone(record.category)}>
-                        {getOptionLabel(
-                          'auditCenter.categoryOptions',
-                          record.category,
-                          categoryValues
-                        )}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="max-w-44">
+                    {showAuditColumns && (
+                      <TableCell>
+                        <Badge className={categoryTone(record.category)}>
+                          {getOptionLabel(
+                            'auditCenter.categoryOptions',
+                            record.category,
+                            categoryValues
+                          )}
+                        </Badge>
+                      </TableCell>
+                    )}
+
+                    {showAuditColumns && (
+                      <TableCell>
+                        <div className="whitespace-nowrap font-mono text-xs">
+                          {toDash(record.endpoint)}
+                        </div>
+                        <div className="whitespace-nowrap text-xs text-muted-foreground">
+                          {toDash(record.node || record.address)}
+                        </div>
+                      </TableCell>
+                    )}
+                    <TableCell className="max-w-52">
                       <div className="flex min-w-0 items-center gap-2">
                         {record.auth_type === 'api_key' ? (
                           <KeyRound className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -664,46 +641,55 @@ export default function AuditCenter() {
                         )}
                         <div className="min-w-0">
                           <div className="truncate font-medium">
-                            {record.user || record.api_key_name || '-'}
+                            {record.api_key_name || record.user || '-'}
                           </div>
                           <div className="truncate text-xs text-muted-foreground">
-                            {record.auth_type || '-'}
+                            {record.user || '-'}
                             {record.client_ip ? ` · ${record.client_ip}` : ''}
                           </div>
                         </div>
                       </div>
                     </TableCell>
-                    <TableCell>
-                      <div className="whitespace-nowrap font-mono text-xs">
-                        {toDash(record.endpoint)}
+                    <TableCell className="max-w-56">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        {record.stream && (
+                          <span
+                            className="size-1.5 shrink-0 rounded-full bg-primary"
+                            title={t('auditCenter.streaming')}
+                          />
+                        )}
+                        <span className="truncate">
+                          {record.model_name || record.model_id || '-'}
+                        </span>
                       </div>
-                      <div className="whitespace-nowrap text-xs text-muted-foreground">
-                        {toDash(record.node || record.address)}
+                      <div className="truncate font-mono text-xs text-muted-foreground">
+                        {/* The uid only earns its line when it is not already above. */}
+                        {record.model_name && record.model_id !== record.model_name
+                          ? record.model_id
+                          : record.model_type || '-'}
                       </div>
                     </TableCell>
-                    <TableCell>
-                      <div className="whitespace-nowrap text-xs">{record.api_key_name || '-'}</div>
+                    <TableCell className="text-right tabular-nums">
+                      {record.prompt_tokens ?? '-'}
                     </TableCell>
-                    <TableCell className="max-w-44">
-                      <div className="truncate">{record.model_name || record.model_id || '-'}</div>
-                      <div className="truncate text-xs text-muted-foreground">
-                        {record.model_type || '-'}
-                      </div>
+                    <TableCell className="text-right tabular-nums">
+                      {record.completion_tokens ?? '-'}
                     </TableCell>
-                    <TableCell>
-                      <div className="whitespace-nowrap font-mono text-xs">
-                        {record.model_id || '-'}
-                      </div>
+                    <TableCell className="whitespace-nowrap text-right tabular-nums">
+                      {formatDuration(record.ttft_ms, t)}
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-right tabular-nums">
+                      {formatDuration(record.latency_ms, t)}
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-right tabular-nums">
+                      {typeof record.output_tps === 'number'
+                        ? t('auditCenter.tokensPerSecond', { value: record.output_tps })
+                        : '-'}
                     </TableCell>
                     <TableCell>
                       <Badge className={statusTone(record.status)}>
                         {getOptionLabel('auditCenter.statusOptions', record.status, statusValues)}
                       </Badge>
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {typeof record.latency_ms === 'number'
-                        ? t('auditCenter.latencyMs', { value: Math.round(record.latency_ms) })
-                        : '-'}
                     </TableCell>
                   </TableRow>
                 ))
