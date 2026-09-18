@@ -18,7 +18,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from xinference.api.routers import admin, models
 from xinference.core.virtual_env_manager import VirtualEnvConflictError
@@ -26,6 +26,21 @@ from xinference.core.virtual_env_manager import VirtualEnvConflictError
 
 def _json_body(response):
     return json.loads(response.body.decode())
+
+
+def _request(request_id: str = "http-request-id") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/requests/req-123/progress",
+            "headers": [(b"x-request-id", request_id.encode())],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
 
 
 @pytest.fixture
@@ -62,6 +77,7 @@ def mock_supervisor():
     supervisor.list_deletable_models = AsyncMock(return_value=[])
     supervisor.confirm_and_remove_model = AsyncMock(return_value=True)
     supervisor.list_virtual_envs = AsyncMock(return_value=[])
+    supervisor.list_virtual_env_packages = AsyncMock(return_value={"packages": []})
     supervisor.remove_virtual_env = AsyncMock(return_value=True)
     supervisor.get_progress = AsyncMock(return_value=0.5)
     return supervisor
@@ -381,6 +397,49 @@ async def test_list_virtual_envs_returns_list(mock_api, mock_supervisor):
 
 
 @pytest.mark.asyncio
+async def test_list_virtual_env_packages_forwards_exact_environment(
+    mock_api, mock_supervisor
+):
+    mock_supervisor.list_virtual_env_packages.return_value = {
+        "packages": [{"name": "vllm", "version": "0.11.2", "size_bytes": 1024}]
+    }
+
+    response = await admin.list_virtual_env_packages(
+        api=mock_api,
+        model_name="Qwen3",
+        model_engine="vllm",
+        python_version="3.12",
+        worker_ip="10.0.0.1",
+    )
+
+    assert response.status_code == 200
+    assert _json_body(response)["packages"][0]["name"] == "vllm"
+    mock_supervisor.list_virtual_env_packages.assert_awaited_once_with(
+        "Qwen3", "vllm", "3.12", "10.0.0.1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_virtual_env_packages_returns_404_for_missing_environment(
+    mock_api, mock_supervisor
+):
+    mock_supervisor.list_virtual_env_packages.side_effect = ValueError(
+        "Virtual environment not found"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.list_virtual_env_packages(
+            api=mock_api,
+            model_name="Qwen3",
+            model_engine="vllm",
+            python_version="3.12",
+            worker_ip="10.0.0.1",
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_remove_virtual_env_requires_model_name(mock_api):
     with pytest.raises(HTTPException) as exc_info:
         await admin.remove_virtual_env(
@@ -432,17 +491,26 @@ async def test_remove_virtual_env_returns_conflict_for_active_model(
 @pytest.mark.asyncio
 async def test_get_progress_returns_progress(mock_api, mock_supervisor):
     mock_supervisor.get_progress.return_value = 0.75
-    response = await admin.get_progress(request_id="req-123", api=mock_api)
+    response = await admin.get_progress(
+        request=_request(), request_id="req-123", api=mock_api
+    )
     assert response.status_code == 200
     assert _json_body(response) == {"progress": 0.75}
-    mock_supervisor.get_progress.assert_called_once_with("req-123")
+    mock_supervisor.get_progress.assert_called_once()
+    args, kwargs = mock_supervisor.get_progress.call_args
+    assert args == ("req-123",)
+    metadata = kwargs["__xinf_rpc_metadata__"]
+    assert metadata["correlation_id"] == "http-request-id"
+    assert metadata["operation_request_id"] == "req-123"
 
 
 @pytest.mark.asyncio
 async def test_get_progress_raises_400_on_key_error(mock_api, mock_supervisor):
     mock_supervisor.get_progress.side_effect = KeyError("req-missing")
     with pytest.raises(HTTPException) as exc_info:
-        await admin.get_progress(request_id="req-missing", api=mock_api)
+        await admin.get_progress(
+            request=_request(), request_id="req-missing", api=mock_api
+        )
     assert exc_info.value.status_code == 400
 
 

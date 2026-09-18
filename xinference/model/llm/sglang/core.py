@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import multiprocessing
@@ -37,6 +38,7 @@ from ....types import (
 from ...utils import check_dependency_available
 from .. import LLM, LLMFamilyV2, LLMSpecV1
 from ..core import chat_context_var, get_model_speculative_tokens_default
+from ..media import materialize_messages_media, media_workspace
 from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
     GEMMA_TOOL_CALL_FAMILY,
@@ -124,6 +126,7 @@ SGLANG_SUPPORTED_MODELS = [
     "MixtralForCausalLM",
     "Qwen2ForCausalLM",
     "OPTForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 SGLANG_SUPPORTED_CHAT_MODELS = [
     "LlamaForCausalLM",
@@ -141,6 +144,7 @@ SGLANG_SUPPORTED_CHAT_MODELS = [
     "Qwen3_5MoeForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HYV3ForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 SGLANG_SUPPORTED_VISION_MODEL_LIST = [
     "Qwen2_5_VLForConditionalGeneration",
@@ -1003,6 +1007,18 @@ class SGLANGChatModel(SGLANGModel, ChatModelMixin):
         chat_template: str = (
             self.model_family.chat_template if self.model_family.chat_template else ""
         )
+        if not chat_template and self.model_family.has_architecture(
+            "Spark2_5ForCausalLM"
+        ):
+            chat_template_path = os.path.join(self.model_path, "chat_template.jinja")
+            try:
+                with open(chat_template_path, encoding="utf-8") as template_file:
+                    chat_template = template_file.read()
+            except OSError as exc:
+                raise ValueError(
+                    "Spark-X2.5 SGLang requires chat_template.jinja from the "
+                    "official model snapshot"
+                ) from exc
         # fix: Object of type list_iterator is not JSON serializable
         tools = list(generate_config.pop("tools", [])) if generate_config else None
         model_family = self.model_family.model_family or self.model_family.model_name
@@ -1105,12 +1121,26 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
         request_id: Optional[str] = None,
     ) -> Union[ChatCompletion, AsyncGenerator[ChatCompletionChunk, None]]:
         import base64
+        import copy
         from io import BytesIO
 
         from PIL import Image
         from qwen_vl_utils import process_vision_info
 
-        messages = self._transform_messages(messages)
+        # qwen_vl_utils fetches urls itself and follows redirects, so the bytes are
+        # pulled here and the messages rewritten to local copies; the reader then
+        # has nothing left to resolve.  Work on a copy so the request never keeps
+        # paths that vanish with the directory.
+        with media_workspace("xinference-sglang-") as temp_dir:
+            messages = copy.deepcopy(messages)
+            # to_thread: blocking I/O on the model actor's event loop.
+            await asyncio.to_thread(materialize_messages_media, messages, temp_dir)
+            messages = self._transform_messages(messages)
+            images, video_inputs = await asyncio.to_thread(
+                process_vision_info, messages
+            )
+        if video_inputs:
+            raise ValueError("Not support video input now.")
 
         tools = list(generate_config.pop("tools", [])) if generate_config else None
         # Handle empty chat_template by falling back to tokenizer's chat_template
@@ -1135,10 +1165,6 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
         prompt = self.get_full_context(
             messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
         )
-
-        images, video_inputs = process_vision_info(messages)
-        if video_inputs:
-            raise ValueError("Not support video input now.")
 
         base64_images: Optional[List[str]] = None
         if images:

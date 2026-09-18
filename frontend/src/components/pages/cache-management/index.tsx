@@ -3,6 +3,8 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import {
+  ArrowDown,
+  ArrowUp,
   Ban,
   Box,
   ChevronRight,
@@ -11,6 +13,7 @@ import {
   Database,
   Download,
   ExternalLink,
+  Package,
   Pause,
   Play,
   RefreshCw,
@@ -32,6 +35,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import PageContainer from '@/components/ui/page-container';
 import { Progress } from '@/components/ui/progress';
 import { SearchInput } from '@/components/ui/search-input';
@@ -51,9 +55,18 @@ import { useMenuAuth } from '@/hooks/use-menu-auth';
 import { ModelType } from '@/constants';
 import request from '@/lib/request';
 import { cn, copyToClipboard, formatFileSize } from '@/lib/utils';
-import type { ModelCachedItem, ModelDownloadItem, ModelEnvItem } from '@/types/services';
+import type {
+  ModelCachedItem,
+  ModelDownloadItem,
+  ModelEnvItem,
+  VirtualEnvPackage,
+} from '@/types/services';
 
 type TabValue = 'models' | 'environments';
+type PackageSort = {
+  key: 'name' | 'size';
+  direction: 'asc' | 'desc';
+};
 const ACTIVE_CACHE_DOWNLOAD_STAGES = new Set(['pending', 'resuming', 'downloading', 'pausing']);
 const MODEL_REGISTRATION_TYPES = [
   ModelType.LLM,
@@ -77,6 +90,10 @@ interface ListResponse<T> {
 
 interface DeleteResponse {
   result?: boolean;
+}
+
+interface VirtualEnvPackagesResponse {
+  packages?: VirtualEnvPackage[];
 }
 
 interface ModelRegistrationListItem {
@@ -120,6 +137,22 @@ function formatDiskUsage(sizeBytes?: number): string {
   return typeof sizeBytes === 'number' && Number.isFinite(sizeBytes)
     ? formatFileSize(Math.max(0, sizeBytes))
     : '-';
+}
+
+function sortPackages(
+  packages: VirtualEnvPackage[],
+  { key, direction }: PackageSort
+): VirtualEnvPackage[] {
+  const multiplier = direction === 'asc' ? 1 : -1;
+
+  return [...packages].sort((left, right) => {
+    const comparison =
+      key === 'name'
+        ? left.name.localeCompare(right.name, undefined, { sensitivity: 'base' })
+        : left.size_bytes - right.size_bytes || left.name.localeCompare(right.name);
+
+    return comparison * multiplier;
+  });
 }
 
 function SummaryCard({ icon, label, value }: { icon: ReactNode; label: string; value: number }) {
@@ -180,10 +213,15 @@ export default function CacheManagement() {
   const [launchingModelName, setLaunchingModelName] = useState<string>();
   const [expandedDownloadUids, setExpandedDownloadUids] = useState<Set<string>>(() => new Set());
   const [pendingAction, setPendingAction] = useState<PendingAction>();
+  const [packageEnvironment, setPackageEnvironment] = useState<ModelEnvItem>();
+  const [environmentPackages, setEnvironmentPackages] = useState<VirtualEnvPackage[]>([]);
+  const [packageSort, setPackageSort] = useState<PackageSort>({ key: 'name', direction: 'asc' });
+  const [packagesLoading, setPackagesLoading] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number>();
   const downloadsInFlight = useRef(false);
   const launchRequestGuardRef = useRef(createLatestRequestGuard());
   const previousDownloadUids = useRef<Set<string>>(new Set());
+  const packageRequestGuardRef = useRef(createLatestRequestGuard());
 
   const availableTabs = useMemo<TabValue[]>(() => {
     const tabs: TabValue[] = [];
@@ -191,6 +229,11 @@ export default function CacheManagement() {
     if (canViewEnvironments) tabs.push('environments');
     return tabs;
   }, [canViewCache, canViewDownloads, canViewEnvironments]);
+
+  const sortedEnvironmentPackages = useMemo(
+    () => sortPackages(environmentPackages, packageSort),
+    [environmentPackages, packageSort]
+  );
 
   useEffect(() => {
     if (!availableTabs.includes(activeTab) && availableTabs[0]) {
@@ -238,6 +281,49 @@ export default function CacheManagement() {
     setEnvironments(asList(response));
     setLastUpdated(Date.now());
   }, [canViewEnvironments]);
+
+  const openPackageDetails = useCallback(async (item: ModelEnvItem) => {
+    const requestId = packageRequestGuardRef.current.start();
+    setPackageEnvironment(item);
+    setEnvironmentPackages([]);
+    setPackageSort({ key: 'name', direction: 'asc' });
+    setPackagesLoading(true);
+    const params = new URLSearchParams({
+      model_name: item.model_name,
+      model_engine: item.model_engine,
+      python_version: item.python_version,
+      worker_ip: item.actor_ip_address,
+    });
+
+    try {
+      const response = await request.get<VirtualEnvPackagesResponse>(
+        `/v1/virtualenvs/packages?${params.toString()}`
+      );
+      if (packageRequestGuardRef.current.isLatest(requestId)) {
+        setEnvironmentPackages(Array.isArray(response?.packages) ? response.packages : []);
+      }
+    } catch {
+      // handled by interceptor
+    } finally {
+      if (packageRequestGuardRef.current.isLatest(requestId)) {
+        setPackagesLoading(false);
+      }
+    }
+  }, []);
+
+  const closePackageDetails = useCallback(() => {
+    packageRequestGuardRef.current.start();
+    setPackageEnvironment(undefined);
+    setEnvironmentPackages([]);
+    setPackagesLoading(false);
+  }, []);
+
+  const togglePackageSort = useCallback((key: PackageSort['key']) => {
+    setPackageSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc',
+    }));
+  }, []);
 
   const loadAll = useCallback(async () => {
     setInitialLoading(true);
@@ -914,21 +1000,31 @@ export default function CacheManagement() {
                           {item.actor_ip_address}
                         </TableCell>
                         <TableCell>
-                          {canDeleteEnvironments ? (
-                            <InfoTooltip content={t('cacheManagement.deleteEnvironment')}>
+                          <div className="flex items-center gap-1">
+                            <InfoTooltip content={t('cacheManagement.packageDetails')}>
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                aria-label={t('cacheManagement.deleteEnvironment')}
-                                className="hover:bg-destructive/10 hover:text-destructive"
-                                onClick={() => setPendingAction({ kind: 'environment', item })}
+                                aria-label={t('cacheManagement.packageDetails')}
+                                onClick={() => void openPackageDetails(item)}
                               >
-                                <Trash2 />
+                                <Package />
                               </Button>
                             </InfoTooltip>
-                          ) : (
-                            '-'
-                          )}
+                            {canDeleteEnvironments && (
+                              <InfoTooltip content={t('cacheManagement.deleteEnvironment')}>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label={t('cacheManagement.deleteEnvironment')}
+                                  className="hover:bg-destructive/10 hover:text-destructive"
+                                  onClick={() => setPendingAction({ kind: 'environment', item })}
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </InfoTooltip>
+                            )}
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))
@@ -961,6 +1057,101 @@ export default function CacheManagement() {
         onConfirm={() => void handleConfirmAction()}
         isLoading={actionLoading}
       />
+
+      <Dialog
+        open={Boolean(packageEnvironment)}
+        onOpenChange={(open) => {
+          if (!open) closePackageDetails();
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>
+              {t('cacheManagement.packageDetails')}
+              {packageEnvironment ? ` - ${packageEnvironment.model_name}` : ''}
+            </DialogTitle>
+          </DialogHeader>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead
+                  aria-sort={
+                    packageSort.key === 'name'
+                      ? packageSort.direction === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                      : 'none'
+                  }
+                >
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 hover:text-foreground"
+                    onClick={() => togglePackageSort('name')}
+                  >
+                    {t('cacheManagement.packageName')}
+                    {packageSort.key === 'name' &&
+                      (packageSort.direction === 'asc' ? (
+                        <ArrowUp className="size-3.5" />
+                      ) : (
+                        <ArrowDown className="size-3.5" />
+                      ))}
+                  </button>
+                </TableHead>
+                <TableHead>{t('cacheManagement.packageVersion')}</TableHead>
+                <TableHead
+                  className="text-right"
+                  aria-sort={
+                    packageSort.key === 'size'
+                      ? packageSort.direction === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                      : 'none'
+                  }
+                >
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 hover:text-foreground"
+                    onClick={() => togglePackageSort('size')}
+                  >
+                    {t('cacheManagement.packageSize')}
+                    {packageSort.key === 'size' &&
+                      (packageSort.direction === 'asc' ? (
+                        <ArrowUp className="size-3.5" />
+                      ) : (
+                        <ArrowDown className="size-3.5" />
+                      ))}
+                  </button>
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {packagesLoading ? (
+                <TableRow>
+                  <TableCell colSpan={3} className="h-32 text-center text-muted-foreground">
+                    {t('cacheManagement.loadingPackages')}
+                  </TableCell>
+                </TableRow>
+              ) : sortedEnvironmentPackages.length ? (
+                sortedEnvironmentPackages.map((item) => (
+                  <TableRow key={`${item.name}:${item.version}`}>
+                    <TableCell className="break-all font-medium">{item.name}</TableCell>
+                    <TableCell>{item.version}</TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatFileSize(item.size_bytes)}
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell colSpan={3} className="h-32 text-center text-muted-foreground">
+                    {t('cacheManagement.noVirtualEnvPackages')}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </DialogContent>
+      </Dialog>
     </PageContainer>
   );
 }

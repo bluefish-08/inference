@@ -151,6 +151,36 @@ logger = getLogger(__name__)
 # corrupt .so files while child subprocesses are importing torch/vllm.
 _venv_setup_done: Dict[str, str] = {}
 
+# Building the SGLang source snapshot used by Spark-X2.5 normally discovers
+# optional Rust extensions through cargo.  Xinference runtime images do not
+# carry a Rust toolchain; SGLang explicitly supports a pure-Python build for
+# serving workloads that do not use those extensions.
+_sglang_source_build_env_lock = threading.Lock()
+
+
+@contextmanager
+def _sglang_source_build_environment(packages: List[str]):
+    uses_sglang_source_snapshot = any(
+        package.split(";", 1)[0]
+        .strip()
+        .startswith("sglang @ git+https://github.com/sgl-project/sglang.git@")
+        for package in packages
+    )
+    if not uses_sglang_source_snapshot:
+        yield
+        return
+
+    with _sglang_source_build_env_lock:
+        old_value = os.environ.get("SGLANG_BUILD_RUST_EXTS")
+        os.environ["SGLANG_BUILD_RUST_EXTS"] = "none"
+        try:
+            yield
+        finally:
+            if old_value is None:
+                os.environ.pop("SGLANG_BUILD_RUST_EXTS", None)
+            else:
+                os.environ["SGLANG_BUILD_RUST_EXTS"] = old_value
+
 
 def _normalize_fingerprint_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -3742,9 +3772,10 @@ class WorkerActor(xo.StatelessActor):
                         cls._uninstall_venv_package(virtual_env_manager, "sgl-kernel")
                     if force_reinstall_xllamacpp:
                         cls._uninstall_venv_package(virtual_env_manager, "xllamacpp")
-                    virtual_env_manager.install_packages(
-                        regular_packages, **conf, **variables
-                    )
+                    with _sglang_source_build_environment(regular_packages):
+                        virtual_env_manager.install_packages(
+                            regular_packages, **conf, **variables
+                        )
 
                     from .virtual_env_manager import apply_flash_attn_wheel_post_install
 
@@ -5458,6 +5489,7 @@ class WorkerActor(xo.StatelessActor):
                     exc_info=True,
                 )
 
+    @log_sync(logger=logger)
     def get_model(self, model_uid: str) -> xo.ActorRefType["ModelActor"]:
         model_status = self._model_uid_to_model_status.get(model_uid)
         if model_status:
@@ -6239,9 +6271,16 @@ class WorkerActor(xo.StatelessActor):
             logger.error(f"Error in list_virtual_envs: {e}")
             raise
 
-    async def list_virtual_env_packages(self, model_name: str) -> Dict[str, Any]:
-        """List packages installed in a specific virtual environment."""
-        return self._virtual_env_manager.list_virtual_env_packages(model_name)
+    async def list_virtual_env_packages(
+        self, model_name: str, model_engine: str, python_version: str
+    ) -> Dict[str, Any]:
+        """List packages installed directly in one virtual environment."""
+        return await asyncio.to_thread(
+            self._virtual_env_manager.list_virtual_env_packages,
+            model_name,
+            model_engine,
+            python_version,
+        )
 
     async def remove_virtual_env(
         self,

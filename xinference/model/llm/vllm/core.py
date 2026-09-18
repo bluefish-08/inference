@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import copy
 import importlib
 import itertools
@@ -59,9 +60,11 @@ from ....types import (
     CompletionUsage,
     LoRA,
 )
+from ...utils import allow_trust_remote_code
 from .. import BUILTIN_LLM_FAMILIES, LLM, LLMFamilyV2, LLMSpecV1
 from ..core import chat_context_var, get_model_speculative_tokens_default
 from ..llm_family import cache_model_tokenizer_and_config
+from ..media import materialize_messages_media, media_workspace, validate_messages_media
 from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
     GEMMA_TOOL_CALL_FAMILY,
@@ -322,6 +325,7 @@ VLLM_SUPPORTED_MULTI_MODEL_LIST: List[str] = []
 VLLM_SUPPORTED_MODELS = [
     "LlamaForCausalLM",
     "MistralForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 VLLM_SUPPORTED_CHAT_MODELS = [
     "LlamaForCausalLM",
@@ -334,6 +338,7 @@ VLLM_SUPPORTED_CHAT_MODELS = [
     "GlmForCausalLM",
     "ChatGLMModel",
     "Qwen3_5MoeForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 
 
@@ -1311,11 +1316,19 @@ class VLLMModel(LLM):
             model_config.setdefault("tokenizer_mode", "deepseek_v32")
         else:
             model_config.setdefault("tokenizer_mode", "auto")
-        # Respect the XINFERENCE_TRUST_REMOTE_CODE setting.
-        model_config["trust_remote_code"] = (
-            bool(model_config.get("trust_remote_code", XINFERENCE_TRUST_REMOTE_CODE))
-            and XINFERENCE_TRUST_REMOTE_CODE
-        )
+        if "Spark2_5ForCausalLM" in architectures:
+            # The official vLLM deployment uses the model's remote-code loader.
+            model_config["trust_remote_code"] = allow_trust_remote_code(
+                self.model_family
+            )
+        else:
+            # Respect the XINFERENCE_TRUST_REMOTE_CODE setting.
+            model_config["trust_remote_code"] = (
+                bool(
+                    model_config.get("trust_remote_code", XINFERENCE_TRUST_REMOTE_CODE)
+                )
+                and XINFERENCE_TRUST_REMOTE_CODE
+            )
         model_config.setdefault("tensor_parallel_size", self._device_count)  # type: ignore
         model_config.setdefault("pipeline_parallel_size", self._n_worker)  # type: ignore
         if (
@@ -2290,7 +2303,13 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
                 or model_family in MINICPM5_TOOL_CALL_FAMILY
             ):
                 full_context_kwargs["tools"] = tools
-        assert self.model_family.chat_template is not None
+        chat_template = self.model_family.chat_template
+        if self.model_family.has_architecture("Spark2_5ForCausalLM"):
+            # The official checkpoint supplies its chat template in tokenizer_config.
+            chat_template = None
+        assert chat_template is not None or self.model_family.has_architecture(
+            "Spark2_5ForCausalLM"
+        )
 
         generate_config = self._sanitize_chat_config(generate_config)
         stream = generate_config.get("stream", None)
@@ -2306,7 +2325,7 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
         logger.debug("tokenizer class: %s", type(tokenizer).__name__)
         full_prompt = self.get_full_context(
             messages,
-            self.model_family.chat_template,
+            chat_template,
             tokenizer=tokenizer,
             **full_context_kwargs,
         )
@@ -2633,7 +2652,7 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
 
         model_family = self.model_family.model_family or self.model_family.model_name
         audios, images, videos, video_kwargs = None, None, None, None
-        temp_dir = None
+        workspace = contextlib.ExitStack()
         try:
             if "internvl" not in model_family.lower():
                 from qwen_omni_utils import (
@@ -2645,14 +2664,16 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                 # Work on a copy so request messages never retain paths that are
                 # removed when the request-level temporary directory is cleaned.
                 messages = copy.deepcopy(messages)
+                temp_dir = workspace.enter_context(media_workspace("xinference-vllm-"))
+                # qwen_omni_utils fetches urls itself and follows redirects, so the
+                # bytes have to be pulled here instead.  to_thread: blocking I/O on
+                # the model actor's event loop.
+                await asyncio.to_thread(materialize_messages_media, messages, temp_dir)
                 if (
                     "vision" in self.model_family.model_ability
                     or "omni" in self.model_family.model_ability
                 ):
-                    import tempfile
-
-                    temp_dir = tempfile.TemporaryDirectory(prefix="xinference-vllm-")
-                    self._handle_base64_media(messages, temp_dir.name)
+                    self._handle_base64_media(messages, temp_dir)
 
                 messages = self._transform_messages(messages)
 
@@ -2680,30 +2701,36 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     model_family
                 )
 
+                # These readers open files and fetch URLs; async_chat runs on the
+                # model actor's event loop, so they must not block it.
                 if "omni" in self.model_family.model_ability:
-                    audios, images, videos, video_kwargs = process_mm_info(
-                        messages, use_audio_in_video=True, return_video_kwargs=True
+                    audios, images, videos, video_kwargs = await asyncio.to_thread(
+                        process_mm_info,
+                        messages,
+                        use_audio_in_video=True,
+                        return_video_kwargs=True,
                     )
                 elif "audio" in self.model_family.model_ability:
-                    audios = process_audio_info(messages, use_audio_in_video=False)
+                    audios = await asyncio.to_thread(
+                        process_audio_info, messages, use_audio_in_video=False
+                    )
                 elif "vision" in self.model_family.model_ability:
-                    images, videos, video_kwargs = process_vision_info(  # type: ignore
-                        messages, return_video_kwargs=True
+                    images, videos, video_kwargs = await asyncio.to_thread(  # type: ignore
+                        process_vision_info, messages, return_video_kwargs=True
                     )
 
                 prompt = self.get_full_context(
                     messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
                 )
             else:
-                prompt, images = self.get_specific_prompt(model_family, messages)
+                # get_specific_prompt fetches through load_media_bytes, so the urls
+                # only need gating here.
+                await asyncio.to_thread(validate_messages_media, messages)
+                prompt, images = await asyncio.to_thread(
+                    self.get_specific_prompt, model_family, messages
+                )
         finally:
-            if temp_dir is not None:
-                try:
-                    temp_dir.cleanup()
-                except Exception:
-                    logger.warning(
-                        "Failed to clean up temporary media directory", exc_info=True
-                    )
+            workspace.close()
         inputs = {"prompt": prompt, "multi_modal_data": {}, "mm_processor_kwargs": {}}
         if images:
             inputs["multi_modal_data"]["image"] = images

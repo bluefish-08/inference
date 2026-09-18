@@ -30,8 +30,9 @@ from .. import (
     _audio_model_variant_identity,
     _install,
     _normalize_legacy_audio_model,
-    load_model_family_from_json,
 )
+from .. import engine_family as audio_engine_family
+from .. import load_model_family_from_json
 from .. import platform as audio_platform
 from .. import sys as audio_sys
 from ..core import create_audio_model_instance, resolve_audio_model_name_and_engine
@@ -42,11 +43,13 @@ from ..engine import (
     MLXKokoroAudioModel,
     MLXWhisperAudioModel,
     PyTorchF5TTSAudioModel,
+    PyTorchFishAudioModel,
     PyTorchFunASRAudioModel,
     PyTorchKokoroAudioModel,
     PyTorchMeloTTSAudioModel,
     PyTorchQwen3TTSAudioModel,
     PyTorchVoxCPMAudioModel,
+    PyTorchYuE2AudioModel,
     TransformersQwen3ASRAudioModel,
     TransformersWhisperAudioModel,
     VLLMQwen3ASRAudioModel,
@@ -61,6 +64,7 @@ from ..engine_family import (
 )
 from ..funasr import FunASRModel
 from ..whisper import WhisperModel
+from ..yue2 import _YUE2_VENDOR_ROOT
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -185,6 +189,7 @@ def apple_mlx_engines():
     model_names = (
         "whisper-tiny",
         "F5-TTS",
+        "FishAudio-S2-Pro",
         "Kokoro-82M",
         "SenseVoiceSmall",
         "Fun-ASR-Nano-2512",
@@ -305,6 +310,88 @@ def test_minimax_music3_without_cuda_is_rejected_before_download():
     cache.assert_not_called()
 
 
+def test_yue2_registration_includes_matching_model_and_vae_sources():
+    specs = {spec.model_hub: spec for spec in BUILTIN_AUDIO_MODELS["YuE2-3B"]}
+
+    assert set(specs) == {"huggingface", "modelscope"}
+    assert specs["huggingface"].model_id == "m-a-p/YuE2-3B"
+    assert specs["huggingface"].model_revision == "main"
+    assert specs["huggingface"].vae_model_id == "m-a-p/YuE2-Vae"
+    assert specs["huggingface"].vae_model_revision == "main"
+    assert specs["modelscope"].model_id == "m-a-p/YuE2-3B"
+    assert specs["modelscope"].model_revision == "master"
+    assert specs["modelscope"].vae_model_id == "m-a-p/YuE2-Vae"
+    assert specs["modelscope"].vae_model_revision == "master"
+
+
+def test_yue2_without_cuda_is_rejected_before_download():
+    engine_mod = __import__(
+        register_builtin_audio_engines.__module__, fromlist=["has_cuda_device"]
+    )
+    with (
+        patch.object(engine_mod, "has_cuda_device", return_value=False),
+        patch.dict(AUDIO_ENGINES, {}, clear=True),
+        patch.object(CacheManager, "cache") as cache,
+    ):
+        register_builtin_audio_engines()
+        for model_spec in BUILTIN_AUDIO_MODELS["YuE2-3B"]:
+            generate_engine_config_by_model_name(model_spec)
+        with pytest.raises(ValueError, match="YuE2 requires an NVIDIA CUDA device"):
+            create_audio_model_instance(
+                "uid",
+                "YuE2-3B",
+                enable_virtual_env=False,
+            )
+    cache.assert_not_called()
+
+
+def test_yue2_pytorch_engine_matches_cuda_model_spec():
+    engine_mod = __import__(
+        PyTorchYuE2AudioModel.__module__, fromlist=["has_cuda_device"]
+    )
+    with patch.object(engine_mod, "has_cuda_device", return_value=True):
+        assert PyTorchYuE2AudioModel.match(_get_spec("YuE2-3B")) is True
+
+
+def test_yue2_engine_discovery_uses_vendored_runtime(monkeypatch):
+    engine_mod = __import__(
+        PyTorchYuE2AudioModel.__module__, fromlist=["has_cuda_device"]
+    )
+    find_spec = audio_engine_family.importlib.util.find_spec
+
+    def find_spec_without_external_yue2(name, *args, **kwargs):
+        if name == "yue2" and _YUE2_VENDOR_ROOT not in sys.path:
+            return None
+        return find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sys, "path", [path for path in sys.path if path != _YUE2_VENDOR_ROOT]
+    )
+    monkeypatch.setattr(
+        audio_engine_family.importlib.util,
+        "find_spec",
+        find_spec_without_external_yue2,
+    )
+
+    for module_name in tuple(sys.modules):
+        if module_name == "yue2" or module_name.startswith("yue2."):
+            monkeypatch.delitem(sys.modules, module_name)
+
+    with (
+        patch.object(engine_mod, "has_cuda_device", return_value=True),
+        patch.dict(AUDIO_ENGINES, {}, clear=True),
+    ):
+        register_builtin_audio_engines()
+        for model_spec in BUILTIN_AUDIO_MODELS["YuE2-3B"]:
+            generate_engine_config_by_model_name(model_spec)
+
+        assert get_engine_params_by_name(
+            "audio", "YuE2-3B", enable_virtual_env=False
+        ) == {"PyTorch": [{"model_name": "YuE2-3B", "model_format": None}]}
+
+    assert "yue2" not in sys.modules
+
+
 def test_consolidated_mlx_specs_and_legacy_aliases(apple_mlx_engines):
     models = apple_mlx_engines
     assert "whisper-tiny-mlx" not in models
@@ -314,6 +401,7 @@ def test_consolidated_mlx_specs_and_legacy_aliases(apple_mlx_engines):
     expected_engines = {
         "whisper-tiny": ["transformers", "MLX"],
         "F5-TTS": ["PyTorch", "MLX"],
+        "FishAudio-S2-Pro": ["PyTorch", "MLX"],
         "Kokoro-82M": ["PyTorch", "MLX"],
         "SenseVoiceSmall": ["PyTorch", "MLX"],
         "Fun-ASR-Nano-2512": ["PyTorch", "MLX"],
@@ -359,6 +447,18 @@ def test_create_consolidated_audio_engines(apple_mlx_engines):
         ("whisper-tiny-mlx", None, MLXWhisperAudioModel, "mlx-community/whisper-tiny"),
         ("F5-TTS", None, PyTorchF5TTSAudioModel, "SWivid/F5-TTS"),
         ("F5-TTS-MLX", None, MLXF5TTSAudioModel, "lucasnewman/f5-tts-mlx"),
+        (
+            "FishAudio-S2-Pro",
+            None,
+            PyTorchFishAudioModel,
+            "fishaudio/s2-pro",
+        ),
+        (
+            "FishAudio-S2-Pro",
+            "MLX",
+            MLXAudioTTSEngineModel,
+            "mlx-community/fish-audio-s2-pro-8bit",
+        ),
         ("Kokoro-82M", None, PyTorchKokoroAudioModel, "hexgrad/Kokoro-82M"),
         ("Kokoro-82M-MLX", None, MLXKokoroAudioModel, "prince-canuma/Kokoro-82M"),
         (
@@ -594,6 +694,7 @@ def test_mlx_audio_specs_pin_isolated_runtime(apple_mlx_engines):
     for model_name in (
         "SenseVoiceSmall",
         "Fun-ASR-Nano-2512",
+        "FishAudio-S2-Pro",
         "Qwen3-ASR-0.6B",
         "Qwen3-TTS-12Hz-0.6B-Base",
         "MeloTTS-English",

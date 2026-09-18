@@ -61,6 +61,189 @@ def filter_ids_and_created(data):
     return data
 
 
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "total_tokens": 5,
+        },
+        SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+        ),
+        SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=1),
+        ),
+        SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+            prompt_tokens_details=SimpleNamespace(
+                model_dump=lambda: None, cached_tokens=1
+            ),
+        ),
+    ],
+)
+def test_sanitize_usage_accepts_dict_and_object(usage):
+    expected = {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    if getattr(usage, "prompt_tokens_details", None) is not None:
+        expected["prompt_tokens_details"] = {"cached_tokens": 1}
+    assert ChatModelMixin._sanitize_usage(usage) == expected
+
+
+def test_sanitize_usage_accepts_openai_completion_usage():
+    pytest.importorskip("openai")
+    from openai.types.completion_usage import CompletionUsage as OpenAICompletionUsage
+
+    usage = OpenAICompletionUsage(
+        prompt_tokens=3,
+        completion_tokens=2,
+        total_tokens=5,
+    )
+
+    assert ChatModelMixin._sanitize_usage(usage) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+
+
+@pytest.mark.parametrize("usage", [None, {}, SimpleNamespace()])
+def test_sanitize_usage_rejects_empty_or_incomplete_usage(usage):
+    assert ChatModelMixin._sanitize_usage(usage) is None
+
+
+def test_sync_tool_chunks_first_choice_keeps_assistant_role(monkeypatch):
+    mixin = ChatModelMixin()
+    mixin.reasoning_parser = None
+    mixin.model_family = "test-family"
+    mixin.model_uid = "test-model"
+    ensure_roles = []
+
+    def to_chat_chunk(completion_chunk, reasoning_parser, previous_texts, ensure_role):
+        ensure_roles.append(ensure_role)
+        return {
+            "choices": [
+                {
+                    "delta": {"role": "assistant", "content": "hello"},
+                    "finish_reason": None,
+                    "logprobs": None,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(mixin, "_to_chat_completion_chunk", to_chat_chunk)
+    monkeypatch.setattr(
+        mixin, "_split_reasoning_tool_chunk", lambda chunk: (chunk, None)
+    )
+    monkeypatch.setattr(
+        mixin,
+        "_get_usage_chat_completion_chunk",
+        lambda chunk, fallback: {"choices": [], "usage": chunk["usage"]},
+    )
+
+    chunks = [
+        {"choices": [], "usage": {"total_tokens": 1}},
+        {"choices": [{"delta": {"content": "hello"}}]},
+    ]
+    results = list(mixin._to_tool_completion_chunks(iter(chunks)))
+
+    assert len(results) == 2
+    assert ensure_roles == [True]
+
+
+@pytest.mark.asyncio
+async def test_async_tool_chunks_increment_role_after_reasoning_only_chunk(
+    monkeypatch,
+):
+    mixin = ChatModelMixin()
+    mixin.reasoning_parser = None
+    mixin.model_family = "test-family"
+    mixin.model_uid = "test-model"
+    ensure_roles = []
+
+    def to_chat_chunk(completion_chunk, reasoning_parser, previous_texts, ensure_role):
+        ensure_roles.append(ensure_role)
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": completion_chunk["reasoning_content"],
+                        "content": None,
+                    },
+                    "finish_reason": None,
+                    "logprobs": None,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(mixin, "_to_chat_completion_chunk", to_chat_chunk)
+    monkeypatch.setattr(
+        mixin, "_split_reasoning_tool_chunk", lambda chunk: (chunk, None)
+    )
+
+    async def chunks():
+        yield {"choices": [{}], "reasoning_content": "first"}
+        yield {"choices": [{}], "reasoning_content": "second"}
+
+    results = [
+        chunk async for chunk in mixin._async_to_tool_completion_chunks(chunks())
+    ]
+
+    assert len(results) == 2
+    assert ensure_roles == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_async_chat_chunks_first_choice_keeps_role_after_usage_chunk():
+    async def chunks():
+        yield {
+            "choices": [],
+            "usage": SimpleNamespace(
+                prompt_tokens=3,
+                completion_tokens=2,
+                total_tokens=5,
+            ),
+        }
+        yield {
+            "id": "cmpl-test",
+            "object": "text_completion",
+            "created": 123,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "text": "hello",
+                    "logprobs": None,
+                    "finish_reason": None,
+                }
+            ],
+        }
+
+    results = [
+        chunk
+        async for chunk in ChatModelMixin._async_to_chat_completion_chunks(chunks())
+    ]
+
+    assert results[0]["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    assert results[1]["choices"][0]["delta"]["role"] == "assistant"
+
+
 def test_to_chat_completion_chunks_usage_only_chunk_without_metadata():
     chunks = [
         {
@@ -307,6 +490,13 @@ class _IncrementalToolParser:
         return (None, "get_weather", {"city": "Beijing"}, 0)
 
 
+class _SequentialToolParser:
+    def extract_tool_calls_streaming(self, previous_texts, current_text, delta_text):
+        if not delta_text:
+            return None
+        return (None, delta_text, {})
+
+
 class _InterleavedIncrementalToolParser:
     def extract_tool_calls_streaming(self, previous_texts, current_text, delta_text):
         events = {
@@ -350,6 +540,54 @@ def test_post_process_completion_chunk_supports_multiple_tool_calls():
         ("get_weather", '{"city": "Beijing"}'),
         ("get_time", '{"timezone": "UTC+8"}'),
     ]
+
+
+def test_post_process_completion_chunk_indexes_tool_calls_across_chunks():
+    mixin = ChatModelMixin()
+    mixin.tool_parser = _SequentialToolParser()
+    previous_texts = [""]
+    tool_call_state = {"seen": False, "next_index": 0}
+    streamed_calls = []
+
+    for name in ["first", "second"]:
+        result = mixin._post_process_completion_chunk(
+            "test-family",
+            "test-model",
+            {
+                "choices": [
+                    {
+                        "delta": {"content": name},
+                        "finish_reason": None,
+                        "logprobs": None,
+                    }
+                ]
+            },
+            previous_texts=previous_texts,
+            tool_call_state=tool_call_state,
+        )
+        assert result is not None
+        streamed_calls.extend(result["choices"][0]["delta"]["tool_calls"])
+
+    final = mixin._post_process_completion_chunk(
+        "test-family",
+        "test-model",
+        {
+            "choices": [
+                {"delta": {"content": ""}, "finish_reason": "stop", "logprobs": None}
+            ]
+        },
+        previous_texts=previous_texts,
+        tool_call_state=tool_call_state,
+    )
+
+    assert final is not None
+    assert [call["index"] for call in streamed_calls] == [0, 1]
+    assert [call["function"]["name"] for call in streamed_calls] == [
+        "first",
+        "second",
+    ]
+    assert final["choices"][0]["finish_reason"] == "tool_calls"
+    assert final["choices"][0]["delta"]["tool_calls"] == []
 
 
 def test_post_process_completion_chunk_preserves_absolute_tool_call_index():
@@ -2830,6 +3068,79 @@ def test_qwen3_family_get_full_context_handles_string_arguments():
         assert base_messages[2]["tool_calls"][0]["function"]["arguments"] == (
             '{"city":"北京"}'
         ), f"{name}: _normalize_tool_call_arguments_to_dict mutated input"
+
+
+def test_spark_x2_5_get_full_context_handles_string_arguments():
+    # Regression for Spark's official template, which rejects OpenAI's JSON
+    # string arguments before rendering tool-call continuation history.
+    spark_template = """
+{%- for message in messages %}
+    {%- if message.role == 'assistant' and message.tool_calls %}
+        {%- for tool_call in message.tool_calls %}
+            {%- if tool_call.function.arguments is not mapping %}
+                {{- raise_exception('tool_call.function.arguments must be a dictionary; normalize JSON strings before apply_chat_template') }}
+            {%- endif %}
+            {%- set args = tool_call.function.arguments %}
+            {{- '<tool_call>' + tool_call.function.name }}
+            {%- for k, v in args.items() %}
+                {{- '<arg_key>' ~ k ~ '</arg_key><arg_value>' ~ (v if v is string else v | tojson) ~ '</arg_value>' }}
+            {%- endfor %}
+            {{- '</tool_call>' }}
+        {%- endfor %}
+    {%- elif message.role == 'tool' %}
+        {{- '<tool_response>' + message.content + '</tool_response>' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}<|assistant|>{%- endif %}
+"""
+    messages = [
+        {"role": "user", "content": "北京天气？"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-weather",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"北京"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-weather",
+            "content": '{"temperature":25}',
+        },
+        {"role": "user", "content": "继续回答。"},
+    ]
+    mixin = ChatModelMixin()
+    mixin.model_family = SimpleNamespace(
+        model_name="Spark-X2.5", model_ability=["chat", "tools"]
+    )
+
+    # SGLang passes the downloaded chat_template.jinja text directly.
+    sglang_prompt = mixin.get_full_context(messages, spark_template)
+
+    class Tokenizer:
+        chat_template = spark_template
+
+        def apply_chat_template(self, rendered_messages, **kwargs):
+            kwargs.pop("add_generation_prompt", None)
+            return mixin._build_from_raw_template(
+                rendered_messages, self.chat_template, **kwargs
+            )
+
+    # Transformers and vLLM pass ``None`` and let tokenizer select template.
+    tokenizer_prompt = mixin.get_full_context(messages, None, tokenizer=Tokenizer())
+    for prompt in (sglang_prompt, tokenizer_prompt):
+        assert "<tool_call>get_weather" in prompt
+        assert "<arg_key>city</arg_key><arg_value>北京</arg_value>" in prompt
+        assert '<tool_response>{"temperature":25}</tool_response>' in prompt
+        assert prompt.endswith("<|assistant|>")
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == ('{"city":"北京"}')
 
 
 def test_minicpm5_get_full_context_handles_string_arguments():

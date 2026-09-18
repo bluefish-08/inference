@@ -70,15 +70,17 @@ from ..constants import (
     is_metrics_disabled,
 )
 from ..core.event import Event, EventCollectorActor, EventType
-from ..core.exceptions import ModelNotReadyError
+from ..core.exceptions import InvalidAudioInputError, ModelNotReadyError
 from ..core.http_protocol import create_hardened_http_protocol
 from ..core.replica_config import ReplicaConfig
+from ..core.rpc_context import actor_call, correlate_model_ref
 from ..core.supervisor import SupervisorActor
 from ..core.utils import CancelMixin
 from ..router.constants import TOKEN_ROUTER_BACKEND_AUTHORIZATION_HEADER
 from ..router.credentials import token_router_data_plane_token
 from ..types import CreateChatCompletion, PeftModelConfig, max_tokens_field
 from .frontend_static import mount_frontend
+from .model_request_logging import ModelRequestLoggingRoute, get_model_request_id
 from .pdf_ocr import (
     DEFAULT_PDF_OCR_DPI,
     PDF_MAGIC,
@@ -113,6 +115,13 @@ from .schemas import (
     TextToVideoRequest,
     UpdateModelRequest,
     WorldGenerationRequest,
+)
+from .streaming_outcome import (
+    FailureOrigin,
+    get_stream_outcome_reporter,
+    observe_stream,
+    report_client_disconnect,
+    report_stream_failure,
 )
 from .utils import get_request_route_path, require_model
 
@@ -349,25 +358,36 @@ def _supports_tool_calls(
 class RESTfulAPI(CancelMixin):
     # Add new class attributes
     _allowed_ip_list: Optional[List[ipaddress.IPv4Network]] = None
+    _cluster_metrics_task: Optional[asyncio.Task[None]] = None
     QWEN38_REASONING_EFFORTS = {"xhigh", "medium", "low"}
-    _cluster_metrics_enabled = False
     QWEN38_REASONING_MODEL_NAMES = {"qwen3.8", "qwen3.8-max"}
 
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
-        # Must start here, not via on_event("startup"): passing lifespan= to
-        # FastAPI makes Starlette ignore on_event handlers entirely.
-        metrics_task = (
-            asyncio.create_task(self._cluster_metrics_update_loop())
-            if self._cluster_metrics_enabled
-            else None
-        )
         try:
+            if not is_metrics_disabled():
+                self._cluster_metrics_task = asyncio.create_task(
+                    self._cluster_metrics_update_loop(),
+                    name="cluster-metrics-updater",
+                )
             yield
         finally:
-            if metrics_task is not None:
-                metrics_task.cancel()
-            await self._close_token_router_client()
+            try:
+                task = self._cluster_metrics_task
+                self._cluster_metrics_task = None
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.warning(
+                            "Cluster metrics updater failed during shutdown",
+                            exc_info=True,
+                        )
+            finally:
+                await self._close_token_router_client()
 
     def __init__(
         self,
@@ -435,8 +455,9 @@ class RESTfulAPI(CancelMixin):
             XINFERENCE_SYSTEM_SETTINGS_PATH
         )
 
-        self._router = APIRouter()
+        self._router = APIRouter(route_class=ModelRequestLoggingRoute)
         self._token_router_client: Optional[httpx.AsyncClient] = None
+        self._cluster_metrics_task = None
         self._app = FastAPI(lifespan=self._lifespan)
         # Initialize allowed IP list once
         self._init_allowed_ip_list()
@@ -601,6 +622,9 @@ class RESTfulAPI(CancelMixin):
     async def _audit_middleware(self, request: Request, call_next):
         started = time.perf_counter()
         response = await call_next(request)
+        model_request_id = getattr(request.state, "model_request_id", None)
+        if model_request_id:
+            response.headers.setdefault("X-Request-ID", str(model_request_id))
         model_uid = getattr(request.state, "_audit_model_uid", "")
         if model_uid:
             if response.status_code < 400:
@@ -761,11 +785,7 @@ class RESTfulAPI(CancelMixin):
         *,
         forward_external_credential: bool = True,
     ) -> tuple[httpx.Response, str]:
-        request_id = (
-            request.headers.get("request-id")
-            or request.headers.get("x-request-id")
-            or f"xinf-{uuid.uuid4()}"
-        )
+        request_id = get_model_request_id(request)
         upstream_url = f"{runtime['endpoint']}/v1/chat/completions"
         client = self._get_token_router_client()
         upstream_request = client.build_request(
@@ -787,7 +807,7 @@ class RESTfulAPI(CancelMixin):
         raw_body: Dict[str, Any],
         runtime: Dict[str, Any],
     ) -> Response:
-        request_id = request.headers.get("x-request-id") or f"xinf-{uuid.uuid4()}"
+        request_id = get_model_request_id(request)
         endpoint = runtime["endpoint"]
         upstream_url = f"{endpoint}/v1/chat/completions"
         client = self._get_token_router_client()
@@ -834,13 +854,20 @@ class RESTfulAPI(CancelMixin):
 
             async def body_stream() -> AsyncIterator[bytes]:
                 try:
-                    async for chunk in upstream_response.aiter_raw():
+                    async for chunk in observe_stream(
+                        upstream_response.aiter_raw(),
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.UPSTREAM,
+                    ):
                         if await request.is_disconnected():
+                            report_client_disconnect(request)
                             break
                         yield chunk
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     raise
-                except Exception:
+                except Exception as exc:
+                    report_stream_failure(request, exc, FailureOrigin.UPSTREAM)
                     logger.exception(
                         "Token Router stream failed: virtual_model_uid=%s "
                         "router_uid=%s instance_id=%s",
@@ -963,7 +990,6 @@ class RESTfulAPI(CancelMixin):
             self._app.add_middleware(MetricsMiddleware)
             self._app.include_router(self._router)
             self._app.add_route("/metrics", metrics)
-            self._cluster_metrics_enabled = True
 
         # Check all the routes returns Response.
         # This is to avoid `jsonable_encoder` performance issue:
@@ -1039,13 +1065,10 @@ class RESTfulAPI(CancelMixin):
 
     async def _cluster_metrics_update_loop(self):
         """Periodically refresh Supervisor-side Prometheus Gauges (every 15s)."""
-        import asyncio
-
         from ..core.metrics import update_cluster_metrics, update_security_gauges
 
         while True:
             try:
-                await asyncio.sleep(15)
                 supervisor_ref = await self._get_supervisor_ref()
                 cluster_data = await supervisor_ref.get_cluster_metrics_data()
                 models_data = await supervisor_ref.list_models()
@@ -1056,8 +1079,14 @@ class RESTfulAPI(CancelMixin):
                 )
                 if self._advanced_auth_service:
                     update_security_gauges(self._advanced_auth_service)
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, xo.ActorNotExist, xo.ServerClosed) as e:
+                logger.warning("Failed to update cluster metrics: %s", e)
             except Exception:
                 logger.warning("Failed to update cluster metrics", exc_info=True)
+
+            await asyncio.sleep(15)
 
     async def _get_builtin_prompts(self) -> JSONResponse:
         """
@@ -1816,14 +1845,20 @@ class RESTfulAPI(CancelMixin):
                         )
                     except RuntimeError as re:
                         self.handle_request_limit_error(re)
-                    async for item in iterator:
+                    async for item in observe_stream(
+                        iterator,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.MODEL_GENERATOR,
+                    ):
                         yield item
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     logger.info(
                         f"Disconnected from client (via refresh/close) {request.client} during generate."
                     )
                     return
                 except Exception as ex:
+                    report_stream_failure(request, ex, FailureOrigin.MODEL_GENERATOR)
                     ex = await self._get_model_last_error(model.uid, ex)
                     logger.exception("Completion stream got an error: %s", ex)
                     await self._report_error_event(model_uid, str(ex))
@@ -1940,6 +1975,8 @@ class RESTfulAPI(CancelMixin):
         )
 
     async def create_message(self, request: Request) -> Response:
+        # Keep Anthropic protocol response IDs backward compatible. The route-level
+        # correlation ID is exposed separately through ``X-Request-ID``.
         request_id = (
             request.headers.get("request-id")
             or request.headers.get("x-request-id")
@@ -2056,23 +2093,42 @@ class RESTfulAPI(CancelMixin):
                     await asyncio.shield(cleanup_task)
 
                 async def router_chunks() -> AsyncIterator[Dict[str, Any]]:
+                    reporter = get_stream_outcome_reporter(request)
+                    upstream_chunks = observe_stream(
+                        upstream_response.aiter_raw(),
+                        reporter,
+                        failure_origin=FailureOrigin.UPSTREAM,
+                    )
+                    protocol_chunks = observe_stream(
+                        self._iter_openai_sse_bytes(upstream_chunks),
+                        reporter,
+                        failure_origin=FailureOrigin.PROTOCOL,
+                    )
                     try:
-                        async for chunk in self._iter_openai_sse_bytes(
-                            upstream_response.aiter_raw()
-                        ):
+                        async for chunk in protocol_chunks:
                             if await request.is_disconnected():
+                                report_client_disconnect(request)
                                 break
                             yield chunk
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as exc:
+                        report_client_disconnect(request, exc)
                         raise
                     except Exception as exc:
+                        report_stream_failure(request, exc, FailureOrigin.PROTOCOL)
                         logger.exception("Anthropic Token Router stream failed")
                         yield {"error": {"type": "api_error", "message": str(exc)}}
                     finally:
                         await release_resources()
 
+                anthropic_events = anthropic_stream_events(
+                    router_chunks(), model_uid, request_id
+                )
                 return EventSourceResponse(
-                    anthropic_stream_events(router_chunks(), model_uid, request_id),
+                    observe_stream(
+                        anthropic_events,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.PROTOCOL,
+                    ),
                     ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
                     headers={"request-id": request_id},
                     background=BackgroundTask(release_resources),
@@ -2124,14 +2180,28 @@ class RESTfulAPI(CancelMixin):
                 return self._anthropic_error(status_code, str(exc), request_id)
 
             async def physical_chunks() -> AsyncIterator[Dict[str, Any]]:
+                reporter = get_stream_outcome_reporter(request)
+                model_chunks = observe_stream(
+                    iterator,
+                    reporter,
+                    failure_origin=FailureOrigin.MODEL_GENERATOR,
+                )
+                protocol_chunks = observe_stream(
+                    self._iter_model_openai_chunks(model_chunks),
+                    reporter,
+                    failure_origin=FailureOrigin.PROTOCOL,
+                )
                 try:
-                    async for chunk in self._iter_model_openai_chunks(iterator):
+                    async for chunk in protocol_chunks:
                         if await request.is_disconnected():
+                            report_client_disconnect(request)
                             break
                         yield chunk
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     raise
                 except Exception as exc:
+                    report_stream_failure(request, exc, FailureOrigin.MODEL_GENERATOR)
                     exc = await self._get_model_last_error(model.uid, exc)
                     logger.exception("Anthropic physical model stream failed")
                     await self._report_error_event(model_uid, str(exc))
@@ -2147,8 +2217,15 @@ class RESTfulAPI(CancelMixin):
                         ):
                             await model.decrease_serve_count()
 
+            anthropic_events = anthropic_stream_events(
+                physical_chunks(), model_uid, request_id
+            )
             return EventSourceResponse(
-                anthropic_stream_events(physical_chunks(), model_uid, request_id),
+                observe_stream(
+                    anthropic_events,
+                    get_stream_outcome_reporter(request),
+                    failure_origin=FailureOrigin.PROTOCOL,
+                ),
                 ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
                 headers={"request-id": request_id},
             )
@@ -2332,6 +2409,9 @@ class RESTfulAPI(CancelMixin):
                 **parsed_kwargs,
             )
             return Response(content=transcription, media_type="application/json")
+        except InvalidAudioInputError as e:
+            logger.warning("Invalid transcription audio for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model_ref.uid, e)
             logger.error(e, exc_info=True)
@@ -2428,7 +2508,11 @@ class RESTfulAPI(CancelMixin):
 
                 async def stream_results():
                     try:
-                        async for item in out:
+                        async for item in observe_stream(
+                            out,
+                            get_stream_outcome_reporter(request),
+                            failure_origin=FailureOrigin.MODEL_GENERATOR,
+                        ):
                             yield item
                     finally:
                         await model.decrease_serve_count()
@@ -2443,6 +2527,9 @@ class RESTfulAPI(CancelMixin):
                     media_type=_audio_response_media_type(body.response_format),
                     content=out,
                 )
+        except InvalidAudioInputError as e:
+            logger.warning("Invalid speech audio for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model.uid, e)
             logger.error(e, exc_info=True)
@@ -2505,7 +2592,12 @@ class RESTfulAPI(CancelMixin):
         try:
             if not model_uid:
                 raise ValueError("Unknown model")
-            await (await self._get_supervisor_ref()).get_model(model_uid)
+            await actor_call(
+                await self._get_supervisor_ref(),
+                "get_model",
+                model_uid,
+                _rpc_correlation_id=get_model_request_id(request),
+            )
             return Response()
         except ModelNotReadyError as e:
             raise HTTPException(
@@ -2988,6 +3080,7 @@ class RESTfulAPI(CancelMixin):
             if stream:
                 return EventSourceResponse(
                     self._stream_image_edit(
+                        request,
                         model_ref,
                         primary_image,
                         reference_images,
@@ -3026,6 +3119,7 @@ class RESTfulAPI(CancelMixin):
 
     async def _stream_image_edit(
         self,
+        request: Request,
         model_ref,
         primary_image: Image.Image,
         reference_images: list,
@@ -3090,6 +3184,7 @@ class RESTfulAPI(CancelMixin):
             }
 
         except Exception as e:
+            report_stream_failure(request, e, FailureOrigin.MODEL_GENERATOR)
             yield {
                 "event": "error",
                 "data": json.dumps(
@@ -3600,13 +3695,18 @@ class RESTfulAPI(CancelMixin):
                     except RuntimeError as re:
                         await self._report_error_event(model_uid, str(re))
                         self.handle_request_limit_error(re)
-                    async for item in iterator:
+                    async for item in observe_stream(
+                        iterator,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.MODEL_GENERATOR,
+                    ):
                         yield item
                     yield "[DONE]"
                 # Note that asyncio.CancelledError does not inherit from Exception.
                 # When the user uses ctrl+c to cancel the streaming chat, asyncio.CancelledError would be triggered.
                 # See https://github.com/sysid/sse-starlette/blob/main/examples/example.py#L48
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     logger.info(
                         f"Disconnected from client (via refresh/close) {request.client} during chat."
                     )
@@ -3615,6 +3715,7 @@ class RESTfulAPI(CancelMixin):
                     # TODO: Cannot yield here. Yield here would leads to error for the next streaming request.
                     return
                 except Exception as ex:
+                    report_stream_failure(request, ex, FailureOrigin.MODEL_GENERATOR)
                     ex = await self._get_model_last_error(model.uid, ex)
                     logger.exception("Chat completion stream got an error: %s", ex)
                     await self._report_error_event(model_uid, str(ex))
@@ -3804,8 +3905,14 @@ class RESTfulAPI(CancelMixin):
                 block_duration,
             )
             supervisor_ref = await self._get_supervisor_ref()
-            res = await supervisor_ref.abort_request(
-                model_uid, request_id, block_duration
+            res = await actor_call(
+                supervisor_ref,
+                "abort_request",
+                model_uid,
+                request_id,
+                block_duration,
+                _rpc_correlation_id=get_model_request_id(request),
+                _rpc_operation_request_id=request_id,
             )
             self._cancel_running_task(request_id, block_duration)
             return JSONResponse(content=res)
@@ -3953,7 +4060,13 @@ class RESTfulAPI(CancelMixin):
         try:
             result = {
                 "progress": float(
-                    await (await self._get_supervisor_ref()).get_progress(request_id)
+                    await actor_call(
+                        await self._get_supervisor_ref(),
+                        "get_progress",
+                        request_id,
+                        _rpc_correlation_id=get_model_request_id(request),
+                        _rpc_operation_request_id=request_id,
+                    )
                 )
             }
             return JSONResponse(content=result)
@@ -3971,9 +4084,18 @@ class RESTfulAPI(CancelMixin):
             if not sd_models:
                 raise ValueError("No running sd models")
 
+            correlation_id = get_model_request_id(request)
             model_list = []
             for model_uid in sd_models:
-                model = await (await self._get_supervisor_ref()).get_model(model_uid)
+                model = correlate_model_ref(
+                    await actor_call(
+                        supervisor_ref,
+                        "get_model",
+                        model_uid,
+                        _rpc_correlation_id=correlation_id,
+                    ),
+                    correlation_id,
+                )
                 result = json.loads(await model.controlnet_model_list())
                 model_list.extend(result["model_list"])
             return Response(
@@ -4017,7 +4139,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
             result = await model.controlnet_module_list()
             return Response(content=result, media_type="application/json")
         except ValueError as e:
@@ -4035,7 +4166,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
             result = await model.controlnet_control_types()
             return Response(content=result, media_type="application/json")
         except ValueError as e:
@@ -4058,7 +4198,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
 
             kwargs = dict(body)
             kwargs.pop("controlnet_images", None)
@@ -4093,7 +4242,13 @@ class RESTfulAPI(CancelMixin):
         model = await require_model(
             self._get_supervisor_ref, body.model, self._report_error_event
         )
-        result = await model.abort_request(body.request_id)
+        result = await actor_call(
+            model,
+            "abort_request",
+            body.request_id,
+            _rpc_correlation_id=get_model_request_id(request),
+            _rpc_operation_request_id=body.request_id,
+        )
         return JSONResponse(content={"status": result})
 
 

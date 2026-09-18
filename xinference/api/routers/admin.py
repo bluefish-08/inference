@@ -19,9 +19,11 @@ from pydantic import BaseModel
 
 from ... import __version__
 from ...constants import XINFERENCE_TOKEN_ROUTER_ENABLED
+from ...core.rpc_context import actor_call
 from ...core.virtual_env_manager import VirtualEnvConflictError
 from ...types import PeftModelConfig
 from ..dependencies import get_api
+from ..model_request_logging import get_model_request_id
 from ..responses import JSONResponse
 
 if TYPE_CHECKING:
@@ -431,6 +433,26 @@ async def list_virtual_envs(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def list_virtual_env_packages(
+    api: "RESTfulAPI" = Depends(get_api),
+    model_name: str = Query(...),
+    model_engine: str = Query(...),
+    python_version: str = Query(...),
+    worker_ip: str = Query(...),
+) -> JSONResponse:
+    try:
+        supervisor_ref = await api._get_supervisor_ref()
+        data = await supervisor_ref.list_virtual_env_packages(
+            model_name, model_engine, python_version, worker_ip
+        )
+        return JSONResponse(content=data)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def remove_virtual_env(
     api: "RESTfulAPI" = Depends(get_api),
     model_name: str = Query(None),
@@ -461,12 +483,21 @@ async def remove_virtual_env(
 
 
 async def get_progress(
+    request: Request,
     request_id: str,
     api: "RESTfulAPI" = Depends(get_api),
 ) -> JSONResponse:
     try:
         supervisor_ref = await api._get_supervisor_ref()
-        result = {"progress": await supervisor_ref.get_progress(request_id)}
+        result = {
+            "progress": await actor_call(
+                supervisor_ref,
+                "get_progress",
+                request_id,
+                _rpc_correlation_id=get_model_request_id(request),
+                _rpc_operation_request_id=request_id,
+            )
+        }
         return JSONResponse(content=result)
     except KeyError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2081,6 +2112,14 @@ def register_routes(api: "RESTfulAPI") -> None:
         dependencies=([Security(auth, scopes=["cache:delete"])] if is_auth else None),
     )
 
+    router.add_api_route(
+        "/v1/virtualenvs/packages",
+        list_virtual_env_packages,
+        methods=["GET"],
+        dependencies=(
+            [Security(auth, scopes=["virtualenv:list"])] if is_auth else None
+        ),
+    )
     router.add_api_route(
         "/v1/virtualenvs",
         list_virtual_envs,

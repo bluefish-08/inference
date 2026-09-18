@@ -84,6 +84,7 @@ from .replica_config import (
     validate_pd_replica_configs,
 )
 from .resource import GPUStatus, ResourceStatus
+from .rpc_context import actor_call
 from .utils import (
     assign_replica_gpu,
     build_replica_model_uid,
@@ -5233,7 +5234,7 @@ class SupervisorActor(xo.StatelessActor):
         ), "worker_ref must be a single worker"
         try:
             return await xo.wait_for(
-                worker_ref.get_model(model_uid=replica_model_uid),
+                actor_call(worker_ref, "get_model", model_uid=replica_model_uid),
                 XINFERENCE_GET_MODEL_RPC_TIMEOUT,
             )
         except ModelNotReadyError:
@@ -5599,7 +5600,15 @@ class SupervisorActor(xo.StatelessActor):
 
         pd_ref = self._pd_model_mapping.get(model_uid)
         if pd_ref is not None:
-            return {"msg": await pd_ref.abort_request(request_id, block_duration)}
+            return {
+                "msg": await actor_call(
+                    pd_ref,
+                    "abort_request",
+                    request_id,
+                    block_duration,
+                    _rpc_operation_request_id=request_id,
+                )
+            }
         res = {"msg": AbortRequestMessage.NO_OP.name}
         replica_info = self._model_uid_to_replica_info.get(model_uid, None)
         if not replica_info:
@@ -5615,8 +5624,19 @@ class SupervisorActor(xo.StatelessActor):
             assert not isinstance(
                 worker_ref, (list, tuple)
             ), "worker_ref must be a single worker"
-            model_ref = await worker_ref.get_model(model_uid=rep_mid)
-            result_info = await model_ref.abort_request(request_id, block_duration)
+            model_ref = await actor_call(
+                worker_ref,
+                "get_model",
+                model_uid=rep_mid,
+                _rpc_operation_request_id=request_id,
+            )
+            result_info = await actor_call(
+                model_ref,
+                "abort_request",
+                request_id,
+                block_duration,
+                _rpc_operation_request_id=request_id,
+            )
             res["msg"] = result_info
             if result_info == AbortRequestMessage.DONE.name:
                 break
@@ -5899,43 +5919,20 @@ class SupervisorActor(xo.StatelessActor):
         return sorted(virtual_envs, key=lambda x: x["model_name"])
 
     async def list_virtual_env_packages(
-        self, model_name: str, worker_ip: Optional[str] = None
+        self,
+        model_name: str,
+        model_engine: str,
+        python_version: str,
+        worker_ip: str,
     ) -> Dict[str, Any]:
-        """List packages in a virtual environment across the cluster."""
-        if not model_name:
-            raise ValueError("model_name is required")
-
-        target_ip_worker_ref = (
-            self._get_worker_ref_by_ip(worker_ip) if worker_ip is not None else None
-        )
-        if (
-            worker_ip is not None
-            and not self.is_local_deployment()
-            and target_ip_worker_ref is None
-        ):
+        """List packages installed directly in one worker virtual environment."""
+        target_ip_worker_ref = self._get_worker_ref_by_ip(worker_ip)
+        if target_ip_worker_ref is None:
             raise ValueError(f"Worker ip address {worker_ip} is not in the cluster.")
 
-        # If specific worker is requested, query only that worker
-        if target_ip_worker_ref:
-            return await target_ip_worker_ref.list_virtual_env_packages(model_name)
-
-        # Otherwise, try all workers until we find the virtual environment
-        for worker in self._worker_address_to_worker.values():
-            try:
-                package_info = await worker.list_virtual_env_packages(model_name)
-                if "error" not in package_info:
-                    return package_info
-            except Exception as e:
-                logger.debug(
-                    f"Worker doesn't have virtual environment for {model_name}: {e}"
-                )
-
-        # If no worker has the virtual environment
-        return {
-            "model_name": model_name,
-            "worker_ip": None,
-            "error": f"Virtual environment for model {model_name} not found on any worker",
-        }
+        return await target_ip_worker_ref.list_virtual_env_packages(
+            model_name, model_engine, python_version
+        )
 
     async def remove_virtual_env(
         self,
@@ -7328,8 +7325,14 @@ class SupervisorActor(xo.StatelessActor):
     def record_metrics(name, op, kwargs):
         record_metrics(name, op, kwargs)
 
+    @log_async(logger=logger)
     async def get_progress(self, request_id: str) -> float:
-        return await self._progress_tracker.get_progress(request_id)
+        return await actor_call(
+            self._progress_tracker,
+            "get_progress",
+            request_id,
+            _rpc_operation_request_id=request_id,
+        )
 
     async def call_collective_manager(
         self, model_uid: str, func_name: str, *args, **kwargs

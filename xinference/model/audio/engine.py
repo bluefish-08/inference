@@ -21,6 +21,7 @@ from .ace_step import AceStepModel, is_ace_step_python_supported
 from .engine_family import SUPPORTED_ENGINES, AudioEngineModel
 from .f5tts import F5TTSModel
 from .f5tts_mlx import F5TTSMLXModel
+from .fish_speech import FishSpeechModel
 from .funasr import FunASRModel
 from .kokoro import KokoroModel
 from .kokoro_mlx import KokoroMLXModel
@@ -33,6 +34,7 @@ from .vllm import VLLMQwen3ASRModel
 from .voxcpm import VoxCPMModel
 from .whisper import WhisperModel
 from .whisper_mlx import WhisperMLXModel
+from .yue2 import YuE2Model, _ensure_vendored_source_path
 
 if TYPE_CHECKING:
     from .core import AudioModelFamilyV2
@@ -59,6 +61,7 @@ MLX_AUDIO_STT_MODEL_NAMES = {
 }
 
 MLX_AUDIO_TTS_MODEL_NAMES = {
+    "FishAudio-S2-Pro",
     "MeloTTS-English",
     "MeloTTS-English-v3",
     "Qwen3-TTS-12Hz-0.6B-Base",
@@ -151,6 +154,25 @@ class PyTorchKokoroAudioModel(KokoroModel, AudioEngineModel):
         return model_family.model_name == "Kokoro-82M"
 
 
+class PyTorchFishAudioModel(FishSpeechModel, AudioEngineModel):
+    required_libs = ("torch",)
+
+    @classmethod
+    def match(cls, model_family: "AudioModelFamilyV2") -> bool:
+        return (
+            model_family.model_name == "FishAudio-S2-Pro"
+            and model_family.model_family == "FishAudio"
+            and _is_engine_or_unspecified(model_family, "PyTorch")
+        )
+
+    @classmethod
+    def is_model_family_supported(cls, model_family: "AudioModelFamilyV2") -> bool:
+        return (
+            model_family.model_name == "FishAudio-S2-Pro"
+            and model_family.model_family == "FishAudio"
+        )
+
+
 class PyTorchFunASRAudioModel(FunASRModel, AudioEngineModel):
     required_libs = ("funasr",)
 
@@ -236,6 +258,21 @@ class PyTorchAceStepAudioModel(AceStepModel, AudioEngineModel):
     @classmethod
     def match(cls, model_family: "AudioModelFamilyV2") -> bool:
         return model_family.model_family == "ace_step_1_5"
+
+
+class PyTorchYuE2AudioModel(YuE2Model, AudioEngineModel):
+    required_libs = ("yue2",)
+
+    @classmethod
+    def check_lib(cls):
+        if virtual_env_allows_missing_engine():
+            return True
+        _ensure_vendored_source_path()
+        return super().check_lib()
+
+    @classmethod
+    def match(cls, model_family: "AudioModelFamilyV2") -> bool:
+        return has_cuda_device() and model_family.model_family == "yue2"
 
 
 class MLXWhisperAudioModel(WhisperMLXModel, AudioEngineModel):
@@ -360,8 +397,10 @@ def register_builtin_audio_engines() -> None:
     SUPPORTED_ENGINES["vLLM"] = [VLLMQwen3ASRAudioModel]
     SUPPORTED_ENGINES["PyTorch"] = [
         PyTorchAceStepAudioModel,
+        PyTorchYuE2AudioModel,
         PyTorchF5TTSAudioModel,
         PyTorchKokoroAudioModel,
+        PyTorchFishAudioModel,
         PyTorchFunASRAudioModel,
         PyTorchQwen3TTSAudioModel,
         PyTorchMeloTTSAudioModel,
