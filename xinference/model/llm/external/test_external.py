@@ -2,6 +2,8 @@
 import asyncio
 import types
 
+import pytest
+
 from .core import ExternalChatModel
 
 
@@ -115,3 +117,89 @@ def test_allow_batch_is_enabled():
     # ModelActor serialises every request behind a lock when this is False,
     # which silently caps the remote endpoint at one concurrent request.
     assert ExternalChatModel.allow_batch is True
+
+
+def test_remote_error_is_picklable_and_keeps_the_message():
+    # The original bug: openai errors carry an httpx.Response, so unpickling
+    # them across the actor boundary raised TypeError about missing kwargs,
+    # replacing the real error with a meaningless one.
+    import pickle
+
+    import httpx
+    from openai import APIConnectionError, BadRequestError, InternalServerError
+
+    from .core import _remote_error
+
+    req = httpx.Request("POST", "http://remote/v1/chat/completions")
+    body = {
+        "error": {"message": "This model's maximum context length is 131072 tokens"}
+    }
+    resp = httpx.Response(400, request=req, json=body)
+
+    for original, expected in (
+        (BadRequestError("bad", response=resp, body=body), ValueError),
+        (
+            InternalServerError(
+                "boom", response=httpx.Response(500, request=req), body=None
+            ),
+            RuntimeError,
+        ),
+        (APIConnectionError(request=req), RuntimeError),
+    ):
+        with pytest.raises(TypeError):
+            pickle.loads(pickle.dumps(original))  # the bug, still present upstream
+
+        converted = _remote_error(original)
+        assert isinstance(converted, expected)
+        assert pickle.loads(pickle.dumps(converted)).args == converted.args
+
+    assert "maximum context length" in str(
+        _remote_error(BadRequestError("bad", response=resp, body=body))
+    )
+    assert "HTTP 400" in str(
+        _remote_error(BadRequestError("bad", response=resp, body=body))
+    )
+
+
+def test_async_chat_converts_remote_errors_on_both_paths():
+    import pickle
+
+    import httpx
+    from openai import BadRequestError
+
+    req = httpx.Request("POST", "http://remote/v1/chat/completions")
+    body = {"error": {"message": "maximum context length is 131072 tokens"}}
+
+    def _fresh():
+        # a new object per raise: reusing one accumulates traceback/context
+        return BadRequestError(
+            "bad", response=httpx.Response(400, request=req, json=body), body=body
+        )
+
+    class _Completions:
+        async def create(self, **kw):
+            raise _fresh()
+
+    m = ExternalChatModel.__new__(ExternalChatModel)
+    m._client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=_Completions())
+    )
+    m._remote_model_name = "remote"
+    msgs = [{"role": "user", "content": "hi"}]
+
+    async def collect():
+        agen = await m.async_chat(msgs, {"stream": True})
+        return [c async for c in agen]
+
+    for call in (
+        lambda: asyncio.run(m.async_chat(msgs, {})),
+        lambda: asyncio.run(collect()),
+    ):
+        with pytest.raises(Exception) as excinfo:
+            call()
+        raised = excinfo.value
+        assert not isinstance(raised, BadRequestError), "openai error must not escape"
+        assert "maximum context length" in str(raised)
+        # __context__ would otherwise still hold the unpicklable openai error
+        assert raised.__context__ is None
+        pickle.loads(pickle.dumps(raised))  # must survive the actor boundary

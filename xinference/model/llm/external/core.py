@@ -49,6 +49,24 @@ _OPENAI_PARAMS = frozenset(
 _INTERNAL_PARAMS = frozenset({"lora_name", "request_id", "stream_interval", "echo"})
 
 
+def _remote_error(exc: Exception) -> Exception:
+    """Restate an openai SDK error as a picklable one.
+
+    openai errors hold an httpx Request/Response, and unpickling re-invokes
+    ``__init__`` without its required kwargs — the original error would reach
+    the client as a bare TypeError about the missing arguments.
+    """
+    status = getattr(exc, "status_code", None)
+    detail = getattr(exc, "message", None) or str(exc)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        detail = (body.get("error") or {}).get("message") or detail
+    if status is None:
+        return RuntimeError(f"Remote endpoint unreachable: {detail}")
+    text = f"Remote endpoint returned HTTP {status}: {detail}"
+    return ValueError(text) if status < 500 else RuntimeError(text)
+
+
 class ExternalChatModel(LLM):
     # The remote server does its own continuous batching; without this the model
     # actor wraps every request in a global asyncio.Lock and serialises them.
@@ -138,23 +156,38 @@ class ExternalChatModel(LLM):
         if extra_body:
             kwargs["extra_body"] = extra_body
 
+        from openai import APIError
+
         if not stream:
-            completion = await self._client.chat.completions.create(
-                model=self._remote_model_name,
-                messages=messages,
-                stream=False,
-                **kwargs,
-            )
-            return completion.model_dump()  # type: ignore[return-value]
+            try:
+                completion = await self._client.chat.completions.create(
+                    model=self._remote_model_name,
+                    messages=messages,
+                    stream=False,
+                    **kwargs,
+                )
+            except APIError as e:
+                converted = _remote_error(e)
+            else:
+                return completion.model_dump()  # type: ignore[return-value]
+            # raised outside the except block: inside it, __context__ would keep
+            # the unpicklable openai error alive and break the actor boundary
+            raise converted
 
         async def _stream() -> AsyncGenerator[ChatCompletionChunk, None]:
-            remote_stream = await self._client.chat.completions.create(
-                model=self._remote_model_name,
-                messages=messages,
-                stream=True,
-                **kwargs,
-            )
-            async for chunk in remote_stream:
-                yield chunk.model_dump()  # type: ignore[misc]
+            try:
+                remote_stream = await self._client.chat.completions.create(
+                    model=self._remote_model_name,
+                    messages=messages,
+                    stream=True,
+                    **kwargs,
+                )
+                async for chunk in remote_stream:
+                    yield chunk.model_dump()  # type: ignore[misc]
+            except APIError as e:
+                converted = _remote_error(e)
+            else:
+                return
+            raise converted
 
         return _stream()
