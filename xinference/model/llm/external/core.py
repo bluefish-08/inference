@@ -67,6 +67,22 @@ def _remote_error(exc: Exception) -> Exception:
     return ValueError(text) if status < 500 else RuntimeError(text)
 
 
+def _alias_reasoning(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Mirror the remote's ``reasoning`` field onto ``reasoning_content``.
+
+    DeepSeek's own API and OpenAI-compatible clients read ``reasoning_content``,
+    while vLLM emits ``reasoning``; serving both keeps either client working.
+    """
+    for choice in payload.get("choices") or ():
+        part = choice.get("message") or choice.get("delta")
+        if not part:
+            continue
+        reasoning = part.get("reasoning")
+        if reasoning is not None and part.get("reasoning_content") is None:
+            part["reasoning_content"] = reasoning
+    return payload
+
+
 class ExternalChatModel(LLM):
     # The remote server does its own continuous batching; without this the model
     # actor wraps every request in a global asyncio.Lock and serialises them.
@@ -169,7 +185,7 @@ class ExternalChatModel(LLM):
             except APIError as e:
                 converted = _remote_error(e)
             else:
-                return completion.model_dump()  # type: ignore[return-value]
+                return _alias_reasoning(completion.model_dump())  # type: ignore[return-value]
             # raised outside the except block: inside it, __context__ would keep
             # the unpicklable openai error alive and break the actor boundary
             raise converted
@@ -183,7 +199,7 @@ class ExternalChatModel(LLM):
                     **kwargs,
                 )
                 async for chunk in remote_stream:
-                    yield chunk.model_dump()  # type: ignore[misc]
+                    yield _alias_reasoning(chunk.model_dump())  # type: ignore[misc]
             except APIError as e:
                 converted = _remote_error(e)
             else:

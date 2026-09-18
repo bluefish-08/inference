@@ -203,3 +203,65 @@ def test_async_chat_converts_remote_errors_on_both_paths():
         # __context__ would otherwise still hold the unpicklable openai error
         assert raised.__context__ is None
         pickle.loads(pickle.dumps(raised))  # must survive the actor boundary
+
+
+def test_alias_reasoning_maps_both_shapes():
+    from .core import _alias_reasoning
+
+    msg = _alias_reasoning(
+        {"choices": [{"message": {"reasoning": "think", "content": "a"}}]}
+    )
+    assert msg["choices"][0]["message"]["reasoning_content"] == "think"
+    delta = _alias_reasoning({"choices": [{"delta": {"reasoning": "t"}}]})
+    assert delta["choices"][0]["delta"]["reasoning_content"] == "t"
+    # a remote that already speaks reasoning_content must not be overwritten
+    kept = _alias_reasoning(
+        {"choices": [{"message": {"reasoning": "new", "reasoning_content": "old"}}]}
+    )
+    assert kept["choices"][0]["message"]["reasoning_content"] == "old"
+    # absent / empty shapes must not raise
+    assert _alias_reasoning({}) == {}
+    assert (
+        _alias_reasoning({"choices": [{"message": {"content": "x"}}]})["choices"][0][
+            "message"
+        ].get("reasoning_content")
+        is None
+    )
+
+
+def test_async_chat_aliases_reasoning_on_both_paths():
+    class _Msg:
+        def model_dump(self):
+            return {"choices": [{"message": {"reasoning": "why", "content": "ok"}}]}
+
+    class _Chunk:
+        def model_dump(self):
+            return {"choices": [{"delta": {"reasoning": "wh"}}]}
+
+    class _Stream:
+        def __aiter__(self):
+            async def gen():
+                yield _Chunk()
+
+            return gen()
+
+    class _Completions:
+        async def create(self, **kw):
+            return _Stream() if kw.get("stream") else _Msg()
+
+    m = ExternalChatModel.__new__(ExternalChatModel)
+    m._client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=_Completions())
+    )
+    m._remote_model_name = "remote"
+    msgs = [{"role": "user", "content": "hi"}]
+
+    got = asyncio.run(m.async_chat(msgs, {}))
+    assert got["choices"][0]["message"]["reasoning_content"] == "why"
+
+    async def collect():
+        agen = await m.async_chat(msgs, {"stream": True})
+        return [c async for c in agen]
+
+    chunks = asyncio.run(collect())
+    assert chunks[0]["choices"][0]["delta"]["reasoning_content"] == "wh"
